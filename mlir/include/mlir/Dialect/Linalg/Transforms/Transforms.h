@@ -1546,6 +1546,8 @@ void populateLinalgTilingCanonicalizationPatterns(RewritePatternSet &patterns);
 /// linalg.generic ops.
 void populateLinalgNamedOpsGeneralizationPatterns(RewritePatternSet &patterns);
 
+void populateDecomposeNamedOpsPatterns(RewritePatternSet &patterns);
+
 /// Linalg decompose convolutions patterns
 
 /// Populates patterns to decompose high-D convolution ops into low-D ones.
