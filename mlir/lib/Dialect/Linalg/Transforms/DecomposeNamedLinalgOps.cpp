@@ -1,31 +1,22 @@
 
 #include "mlir/Dialect/Linalg/Passes.h"
 
-// #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-// #include "llvm/Support/Debug.h"
+#include "llvm/Support/Debug.h"
 
 namespace mlir {
 #define GEN_PASS_DEF_LINALGDECOMPOSENAMEDOPSPASS
 #include "mlir/Dialect/Linalg/Passes.h.inc"
 } // namespace mlir
 
-// #define DEBUG_TYPE "linalg-decompose-named-ops"
+#define DEBUG_TYPE "linalg-decompose-named-ops"
 
 using namespace mlir;
 using namespace mlir::linalg;
 
 namespace {
-
-void printShape(ArrayRef<int64_t> shape, StringRef name = "shape") {
-  llvm::errs() << name << ": ";
-  for (auto dim : shape)
-    llvm::errs() << dim << " ";
-  llvm::errs() << "\n";
-}
-
 TypedAttr createInitValueForReduceMaxOp(Type type, PatternRewriter &rewriter) {
   if (isa<FloatType>(type))
     return rewriter.getFloatAttr(
@@ -49,7 +40,7 @@ TypedAttr createInitValueForReduceSumOp(Type type, PatternRewriter &rewriter) {
 Value createLinalgReduceMaxBody(PatternRewriter &rewriter, Location loc,
                                 ValueRange args, Type elementTy) {
   if (isa<FloatType>(elementTy))
-    return rewriter.create<arith::MaximumFOp>(loc, args[0], args[1]);
+    return rewriter.create<arith::MaxNumFOp>(loc, args[0], args[1]);
   if (isa<IntegerType>(elementTy))
     return rewriter.create<arith::MaxSIOp>(loc, args[0], args[1]);
   return {};
@@ -75,7 +66,6 @@ struct DecomposeSoftmaxPattern : public OpRewritePattern<SoftmaxOp> {
     auto resultTy = op.getOutputOperandType();
     auto dim = op.getDimension();
     auto elementTy = resultTy.getElementType();
-    // llvm::errs() << "elType: " << elementTy << "\n";
 
     SmallVector<int64_t> reduceShape;
     SmallVector<Value> dynDims;
@@ -87,9 +77,6 @@ struct DecomposeSoftmaxPattern : public OpRewritePattern<SoftmaxOp> {
               rewriter.create<tensor::DimOp>(loc, op.getInput(), i));
       }
     }
-
-    // printShape(reduceShape, "reduceShape");
-
     auto emptyTensor =
         rewriter
             .create<tensor::EmptyOp>(loc, reduceShape,
@@ -99,6 +86,7 @@ struct DecomposeSoftmaxPattern : public OpRewritePattern<SoftmaxOp> {
     if (!fillValAttr)
       return rewriter.notifyMatchFailure(
           op, "No initial value found for reduction operation");
+
     auto fillValue = rewriter.create<arith::ConstantOp>(loc, fillValAttr);
     auto filledTensor = rewriter
                             .create<linalg::FillOp>(loc, ValueRange{fillValue},
@@ -118,15 +106,12 @@ struct DecomposeSoftmaxPattern : public OpRewritePattern<SoftmaxOp> {
         loc, reduceOp.getResult(0), bcastOutput, reduceOp.getDimensionsAttr());
     Value broadcastedReductionTensor = broadcastedReduction.getResults()[0];
 
-    auto subResultTensor = rewriter.create<tensor::EmptyOp>(
-        loc, op.getOutputOperandType().getShape(), elementTy);
-
-    // printShape(subResultTensor.getType().getShape(), "subResultShape");
     auto subOp = rewriter.create<linalg::SubOp>(
         loc, ValueRange{op.getInput(), broadcastedReductionTensor},
-        ValueRange{subResultTensor});
-    auto expOp = rewriter.create<linalg::ExpOp>(
-        loc, ValueRange{subOp.getResult(0)}, ValueRange{subResultTensor});
+        ValueRange{broadcastedReductionTensor});
+    auto expOp =
+        rewriter.create<linalg::ExpOp>(loc, ValueRange{subOp.getResult(0)},
+                                       ValueRange{broadcastedReductionTensor});
 
     auto sumEmptyTensor =
         rewriter
@@ -137,6 +122,7 @@ struct DecomposeSoftmaxPattern : public OpRewritePattern<SoftmaxOp> {
     if (!sumFillValAttr)
       return rewriter.notifyMatchFailure(
           op, "No initial value found for reduction operation");
+
     auto sumFillValue = rewriter.create<arith::ConstantOp>(loc, sumFillValAttr);
     auto sumFilledTensor =
         rewriter
@@ -159,7 +145,7 @@ struct DecomposeSoftmaxPattern : public OpRewritePattern<SoftmaxOp> {
         sumBroadcastedReduction.getResults()[0];
     auto divOp = rewriter.create<DivOp>(
         loc, ValueRange{expOp.getResult(0), sumBroadcastedReductionTensor},
-        ValueRange{op.getOutput()});
+        ValueRange{sumBroadcastedReductionTensor});
     rewriter.replaceOp(op, divOp.getResults());
     return success();
   }
