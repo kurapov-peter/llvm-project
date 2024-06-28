@@ -143,9 +143,9 @@ struct DecomposeSoftmaxPattern : public OpRewritePattern<SoftmaxOp> {
         reduceSumOp.getDimensionsAttr());
     Value sumBroadcastedReductionTensor =
         sumBroadcastedReduction.getResults()[0];
-    auto divOp = rewriter.create<DivOp>(
+    auto divOp = rewriter.create<linalg::DivOp>(
         loc, ValueRange{expOp.getResult(0), sumBroadcastedReductionTensor},
-        ValueRange{sumBroadcastedReductionTensor});
+        ValueRange{op.getOutput()});
     rewriter.replaceOp(op, divOp.getResults());
     return success();
   }
