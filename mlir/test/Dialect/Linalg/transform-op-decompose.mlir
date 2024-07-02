@@ -249,7 +249,12 @@ module attributes {transform.with_named_sequence} {
     %1 = transform.structured.decompose %0 : (!transform.any_op) -> !transform.any_op
 
     %2 = transform.structured.match ops{["linalg.softmax"]} in %arg1 : (!transform.any_op) -> !transform.any_op
+    transform.print %2{name = "individual softmax"} : !transform.any_op
     %3 = transform.structured.decompose_interface %2 : (!transform.any_op) -> !transform.any_op
+    transform.print %3 {name = "decomposed softmax"} : !transform.any_op
+    %4 = transform.structured.generalize %3: (!transform.any_op) -> !transform.any_op
+    transform.print %4 {name = "decomposed and generalized softmax"} : !transform.any_op
+    
     transform.yield
   }
 }

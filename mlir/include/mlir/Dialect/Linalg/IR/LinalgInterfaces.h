@@ -30,6 +30,10 @@ class IteratorTypeAttr;
 class LinalgOp;
 class GenericOp;
 
+struct DecompositionResult {
+  SmallVector<Operation *> decomposedOps;
+  SmallVector<Value> decomposedValues;
+};
 namespace detail {
 /// Implementation of the method that check if given operands
 /// can be dropped, i.e. the remaining operands can compute the loop

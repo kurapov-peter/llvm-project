@@ -2675,6 +2675,43 @@ static Value buildDivOp(OpBuilder &builder, Location loc, Value numerator,
       });
   return genericOp.getResult(0);
 }
+
+TypedAttr createInitValueForReduceMaxOp(Type type, OpBuilder &b) {
+  if (isa<FloatType>(type))
+    return b.getFloatAttr(
+        type, APFloat::getSmallest(cast<FloatType>(type).getFloatSemantics()));
+  if (isa<IntegerType>(type))
+    return b.getIntegerAttr(
+        type, APInt::getSignedMinValue(type.getIntOrFloatBitWidth()));
+  return {};
+}
+
+TypedAttr createInitValueForReduceSumOp(Type type, OpBuilder &b) {
+  if (isa<FloatType>(type))
+    return b.getFloatAttr(
+        type, APFloat::getZero(cast<FloatType>(type).getFloatSemantics()));
+  if (isa<IntegerType>(type))
+    return b.getIntegerAttr(type, APInt::getZero(type.getIntOrFloatBitWidth()));
+  return {};
+}
+
+Value createLinalgReduceMaxBody(OpBuilder b, Location loc, ValueRange args,
+                                Type elementTy) {
+  if (isa<FloatType>(elementTy))
+    return b.create<arith::MaxNumFOp>(loc, args[0], args[1]);
+  if (isa<IntegerType>(elementTy))
+    return b.create<arith::MaxSIOp>(loc, args[0], args[1]);
+  return {};
+}
+
+Value createLinalgReduceSumBody(OpBuilder &b, Location loc, ValueRange args,
+                                Type elementTy) {
+  if (isa<FloatType>(elementTy))
+    return b.create<arith::AddFOp>(loc, args[0], args[1]);
+  if (isa<IntegerType>(elementTy))
+    return b.create<arith::AddIOp>(loc, args[0], args[1]);
+  return {};
+}
 // @} End helper functions for softmax decomposition.
 
 /// Given an N-dimensional tensor x, this method converts
@@ -2695,7 +2732,7 @@ static Value buildDivOp(OpBuilder &builder, Location loc, Value numerator,
 /// 4. Divide z and l. This gives the N-dimensional softmax.
 ///    softmax = z / l
 ///
-FailureOr<SmallVector<Value>> SoftmaxOp::decomposeOperation(OpBuilder &b) {
+FailureOr<DecompositionResult> SoftmaxOp::decomposeOperation(OpBuilder &b) {
   OpBuilder::InsertionGuard guard(b);
   b.setInsertionPoint(*this);
   Location loc = getLoc();
@@ -2708,30 +2745,89 @@ FailureOr<SmallVector<Value>> SoftmaxOp::decomposeOperation(OpBuilder &b) {
   dims.erase(dims.begin() + reductionDim);
   // Step 1: Compute max along dim.
   Value outputReduce = b.create<tensor::EmptyOp>(loc, dims, elementType);
-  Value neutralForMaxF = arith::getIdentityValue(arith::AtomicRMWKind::maximumf,
-                                                 elementType, b, loc,
-                                                 /*useOnlyFiniteValue=*/true);
+  // Value neutralForMaxF =
+  // arith::getIdentityValue(arith::AtomicRMWKind::maximumf,
+  //                                                elementType, b, loc,
+  //                                                /*useOnlyFiniteValue=*/true);
+  // Value neutralForMaxFInit =
+  //     b.create<linalg::FillOp>(loc, Value{neutralForMaxF}, outputReduce)
+  //         .result();
+  // Value max =
+  //     reduce<arith::MaxNumFOp>(b, loc, input, neutralForMaxFInit,
+  //     reductionDim);
+
+  auto fillValAttr = createInitValueForReduceMaxOp(elementType, b);
+  auto fillValue = b.create<arith::ConstantOp>(loc, fillValAttr);
   Value neutralForMaxFInit =
-      b.create<linalg::FillOp>(loc, Value{neutralForMaxF}, outputReduce)
+      b.create<linalg::FillOp>(loc, ValueRange{fillValue},
+                               ValueRange{outputReduce})
           .result();
-  Value max =
-      reduce<arith::MaxNumFOp>(b, loc, input, neutralForMaxFInit, reductionDim);
+  auto max = b.create<linalg::ReduceOp>(
+      loc, input, neutralForMaxFInit, reductionDim,
+      [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+        auto result =
+            createLinalgReduceMaxBody(b, nestedLoc, args, elementType);
+        nestedBuilder.create<linalg::YieldOp>(nestedLoc, result);
+      });
 
   // Step 2: Subtract max from input and exponentiate.
-  Value numerator = buildSubAndExpOp(b, loc, input, max, output, reductionDim);
+  // Value numerator = buildSubAndExpOp(b, loc, input, max, output,
+  // reductionDim);
+  auto bcastOutput = b.create<tensor::EmptyOp>(
+      loc, getOutput().getType().getShape(), elementType);
+  auto broadcastedReduction = b.create<linalg::BroadcastOp>(
+      loc, max.getResult(0), bcastOutput, max.getDimensionsAttr());
+  Value broadcastedReductionTensor = broadcastedReduction.getResults()[0];
+
+  auto subOp = b.create<linalg::SubOp>(
+      loc, ValueRange{input, broadcastedReductionTensor},
+      ValueRange{broadcastedReductionTensor});
+  auto expOp = b.create<linalg::ExpOp>(loc, ValueRange{subOp.getResult(0)},
+                                       ValueRange{broadcastedReductionTensor});
 
   // Step 3: Compute sum along dim.
-  Value zero = arith::getIdentityValue(arith::AtomicRMWKind::addf, elementType,
-                                       b, loc, /*useOnlyFiniteValue=*/true);
-  Value zeroInit =
-      b.create<linalg::FillOp>(loc, Value{zero}, outputReduce).result();
-  Value denominator =
-      reduce<arith::AddFOp>(b, loc, numerator, zeroInit, reductionDim);
+  // Value zero = arith::getIdentityValue(arith::AtomicRMWKind::addf,
+  // elementType,
+  //                                      b, loc, /*useOnlyFiniteValue=*/true);
+  // Value zeroInit =
+  //     b.create<linalg::FillOp>(loc, Value{zero}, outputReduce).result();
+  // Value denominator =
+  //     reduce<arith::AddFOp>(b, loc, numerator, zeroInit, reductionDim);
+  auto sumEmptyTensor =
+      b.create<tensor::EmptyOp>(
+           loc, cast<ShapedType>(outputReduce.getType()).getShape(),
+           elementType)
+          .getResult();
+  auto sumFillValAttr = createInitValueForReduceSumOp(elementType, b);
+  auto sumFillValue = b.create<arith::ConstantOp>(loc, sumFillValAttr);
+  auto sumFillOp = b.create<linalg::FillOp>(loc, ValueRange{sumFillValue},
+                                            ValueRange{sumEmptyTensor});
+  auto sumFilledTensor = sumFillOp.result();
+  auto reduceSumOp = b.create<linalg::ReduceOp>(
+      loc, expOp.getResults(), sumFilledTensor, reductionDim,
+      [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange args) {
+        auto result =
+            createLinalgReduceSumBody(b, nestedLoc, args, elementType);
+        nestedBuilder.create<linalg::YieldOp>(nestedLoc, result);
+      });
 
   // Step 4: Compute softmax.
-  Value result =
-      buildDivOp(b, loc, numerator, denominator, output, reductionDim);
-  return SmallVector<Value>{result};
+  // Value result =
+  //     buildDivOp(b, loc, numerator, denominator, output, reductionDim);
+  auto sumBcastOutput = b.create<tensor::EmptyOp>(
+      loc, getOutputOperandType().getShape(), elementType);
+  auto sumBroadcastedReduction = b.create<linalg::BroadcastOp>(
+      loc, reduceSumOp.getResult(0), sumBcastOutput,
+      reduceSumOp.getDimensionsAttr());
+  Value sumBroadcastedReductionTensor = sumBroadcastedReduction.getResults()[0];
+  auto divOp = b.create<linalg::DivOp>(
+      loc, ValueRange{expOp.getResult(0), sumBroadcastedReductionTensor},
+      ValueRange{output});
+  Value result = divOp.getResult(0);
+  return DecompositionResult{{max, broadcastedReduction, subOp, expOp,
+                              sumFillOp, reduceSumOp, sumBroadcastedReduction,
+                              divOp},
+                             {result}};
 }
 
 //===----------------------------------------------------------------------===//
