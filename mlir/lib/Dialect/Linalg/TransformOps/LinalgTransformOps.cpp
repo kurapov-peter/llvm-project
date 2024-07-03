@@ -435,7 +435,7 @@ DiagnosedSilenceableFailure
 transform::DecomposeInterfaceOp::apply(transform::TransformRewriter &rewriter,
                                        TransformResults &transformResults,
                                        TransformState &state) {
-  for (Operation *target : state.getPayloadOps(getTarget())) {
+  for (auto [i, target] : llvm::enumerate(state.getPayloadOps(getTarget()))) {
     auto decomposableOp = dyn_cast<AggregatedOpInterface>(target);
     if (!decomposableOp)
       continue;
@@ -446,7 +446,7 @@ transform::DecomposeInterfaceOp::apply(transform::TransformRewriter &rewriter,
       return emitDefaultSilenceableFailure(target);
 
     rewriter.replaceOp(decomposableOp, maybeNewResults->decomposedValues);
-    transformResults.set(cast<OpResult>(getResult()),
+    transformResults.set(cast<OpResult>(getResult(i)),
                          maybeNewResults->decomposedOps);
   }
   return DiagnosedSilenceableFailure::success();

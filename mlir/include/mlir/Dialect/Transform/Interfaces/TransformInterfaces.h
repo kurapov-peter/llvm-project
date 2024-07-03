@@ -820,7 +820,6 @@ public:
   template <typename Range>
   void set(OpResult value, Range &&ops) {
     int64_t position = value.getResultNumber();
-    llvm::errs() << "Setting value for position " << position << "\n";
     assert(position < static_cast<int64_t>(operations.size()) &&
            "setting results for a non-existent handle");
     assert(operations[position].data() == nullptr && "results already set");

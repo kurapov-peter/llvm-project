@@ -1324,7 +1324,7 @@ def DecomposeInterfaceOp : Op<Transform_Dialect, "structured.decompose_interface
   }];
 
   let arguments = (ins TransformHandleTypeInterface:$target);
-  let results = (outs TransformHandleTypeInterface:$transformed);
+  let results = (outs Variadic<TransformHandleTypeInterface>:$transformed);
   let assemblyFormat =
       "$target attr-dict `:` functional-type(operands, results)";
 
