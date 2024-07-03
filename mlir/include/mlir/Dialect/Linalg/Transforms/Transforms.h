@@ -1546,10 +1546,10 @@ void populateLinalgTilingCanonicalizationPatterns(RewritePatternSet &patterns);
 /// linalg.generic ops.
 void populateLinalgNamedOpsGeneralizationPatterns(RewritePatternSet &patterns);
 
-/// Populates `patterns` with to decompose high-level named ops (e.g., softmax)
-/// into a sequence of simpler linalg named ops, defining the operation
-/// semantics.
-void populateDecomposeNamedOpsPatterns(RewritePatternSet &patterns);
+/// Populates `patterns` with patterns to decompose high-level aggregate named
+/// ops (e.g., softmax) into a sequence of simpler linalg named ops, defining
+/// the operation semantics.
+void populateDecomposeAggregateNamedOpsPatterns(RewritePatternSet &patterns);
 
 /// Linalg decompose convolutions patterns
 
