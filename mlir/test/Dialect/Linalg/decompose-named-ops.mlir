@@ -16,17 +16,16 @@ func.func @softmax(%arg0: tensor<2x16x32xf32>, %dst: tensor<2x16x32xf32>) -> ten
 // CHECK-NEXT: (%[[IN:.+]]: f32, %[[INIT:.+]]: f32) {
 // CHECK-NEXT: %[[MAX:.+]] = arith.maxnumf %[[IN]], %[[INIT]] : f32
 // CHECK-NEXT: linalg.yield %[[MAX]] : f32
-// CHECK-DAG:  %[[EMP:.+]] = tensor.empty() : tensor<2x16x32xf32>
 // CHECK:      %[[CST:.+]] = linalg.broadcast ins(%[[RED]] : tensor<2x16xf32>)
 // CHECK-NEXT: %[[SUB:.+]] = linalg.sub ins(%[[ARG0]], %[[CST]] : tensor<2x16x32xf32>, tensor<2x16x32xf32>)
 // CHECK-NEXT: %[[EXP:.+]] = linalg.exp ins(%[[SUB]] : tensor<2x16x32xf32>)
-// CHECK-DAG:  %[[EMP:.+]] = tensor.empty() : tensor<2x16xf32>
 // CHECK-DAG:  %[[FIL:.+]] = linalg.fill
 // CHECK-NEXT: %[[SUM:.+]] = linalg.reduce ins(%[[EXP]] : tensor<2x16x32xf32>)
 // CHECK-SAME:  outs(%[[FIL]] : tensor<2x16xf32>) dimensions = [2]
 // CHECK-NEXT: (%[[IN:.+]]: f32, %[[INIT:.+]]: f32) {
 // CHECK-NEXT: %[[ADD:.+]] = arith.addf %[[IN]], %[[INIT]] : f32
 // CHECK-NEXT: linalg.yield %[[ADD]] : f32
+// CHECK-DAG:  %[[EMP:.+]] = tensor.empty() : tensor<2x16x32xf32>
 // CHECK-DAG:  %[[CST2:.+]] = linalg.broadcast ins(%[[SUM]] : tensor<2x16xf32>)
 // CHECK-NEXT: %[[DIV:.+]] = linalg.div ins(%[[EXP]], %[[CST2]] : tensor<2x16x32xf32>, tensor<2x16x32xf32>) outs(%[[DST]] : tensor<2x16x32xf32>)
 // CHECK: return %[[DIV]]
