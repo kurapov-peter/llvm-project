@@ -522,9 +522,9 @@ gpu.module @kernels {
 
 gpu.module @kernels {
 // OPENCL-LABEL:   llvm.func spir_funccc @no_address_spaces(
-// OPENCL-SAME:                                             {{.*}}: !llvm.ptr<1>
-// OPENCL-SAME:                                             {{.*}}: !llvm.ptr<1>
-// OPENCL-SAME:                                             {{.*}}: !llvm.ptr<1>
+// OPENCL-SAME:                                             %{{[a-zA-Z_][a-zA-Z0-9_]*}}: !llvm.ptr<1>
+// OPENCL-SAME:                                             %{{[a-zA-Z_][a-zA-Z0-9_]*}}: !llvm.ptr<1>
+// OPENCL-SAME:                                             %{{[a-zA-Z_][a-zA-Z0-9_]*}}: !llvm.ptr<1>
   gpu.func @no_address_spaces(%arg0: memref<f32>, %arg1: memref<f32, #gpu.address_space<global>>, %arg2: memref<f32>) {
     gpu.return
   }
