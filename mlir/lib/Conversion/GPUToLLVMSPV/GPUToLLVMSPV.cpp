@@ -306,6 +306,70 @@ struct GPUShuffleConversion final : ConvertOpToLLVMPattern<gpu::ShuffleOp> {
   }
 };
 
+struct ConvertGpuSignatureMemrefs final
+    : public ConvertOpToLLVMPattern<gpu::GPUFuncOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+  LogicalResult
+  matchAndRewrite(gpu::GPUFuncOp func, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const final {
+    bool allArgsHaveExplicitAddrSpaceAttributes = true;
+    SmallVector<Type, 4> argTypes;
+    for (auto [index, argType] : enumerate(func.getArgumentTypes())) {
+      if (auto memrefType = llvm::dyn_cast<MemRefType>(argType)) {
+        // llvm::errs() << "Found a memref argument of type " << memrefType
+        //              << "\n";
+        auto attr = memrefType.getMemorySpace();
+        if (attr) {
+          // llvm::errs() << "Already has memory space attr attached (" << attr
+          //              << "). Skipping argument...\n";
+          argTypes.push_back(argType);
+          continue;
+          // return failure();
+        } else {
+          allArgsHaveExplicitAddrSpaceAttributes = false;
+        }
+        // llvm::errs()
+        //     << "Found a memref with no addr space attribute at position "
+        //     << index << "\n";
+        auto newMemrefType =
+            MemRefType::get(memrefType.getShape(), memrefType.getElementType(),
+                            memrefType.getLayout(),
+                            gpu::AddressSpaceAttr::get(
+                                getContext(), gpu::AddressSpace::Global));
+        argTypes.push_back(newMemrefType);
+      } else {
+        argTypes.push_back(argType);
+      }
+    }
+
+    // Update the block args.
+    Block &entryBlock = func.front();
+    for (auto [bbArg, type] : llvm::zip(entryBlock.getArguments(), argTypes)) {
+      if (bbArg.getType() == type)
+        continue;
+
+      // Collect all uses of the bbArg.
+      SmallVector<OpOperand *> bbArgUses;
+      for (OpOperand &use : bbArg.getUses())
+        bbArgUses.push_back(&use);
+
+      // Change the bbArg type to memref with the correct addr space.
+      bbArg.setType(type);
+
+      // Is this required for correctness?
+      if (!bbArgUses.empty()) {
+        for (OpOperand *use : bbArgUses)
+          use->set(bbArg);
+      }
+    }
+
+    FunctionType funcType = FunctionType::get(getContext(), argTypes, {});
+    func.setType(funcType);
+
+    return allArgsHaveExplicitAddrSpaceAttributes ? failure() : success();
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // GPU To LLVM-SPV Pass.
 //===----------------------------------------------------------------------===//
@@ -324,6 +388,22 @@ struct GPUToLLVMSPVConversionPass final
 
     LLVMTypeConverter converter(context, options);
     LLVMConversionTarget target(*context);
+
+    // llvm::errs() << "IR before signature rewriting:\n";
+    // llvm::errs() << getOperation() << "\n";
+    // llvm::errs() << "-----------------------------\n";
+
+    if (forceOpenclAddressSpaces) {
+      RewritePatternSet prepatterns(context);
+      prepatterns.add<ConvertGpuSignatureMemrefs>(converter);
+      if (failed(applyPartialConversion(getOperation(), target,
+                                        std::move(prepatterns))))
+        signalPassFailure();
+    }
+
+    // llvm::errs() << "IR after signature rewriting:\n";
+    // llvm::errs() << getOperation() << "\n";
+    // llvm::errs() << "-----------------------------\n";
 
     target.addIllegalOp<gpu::BarrierOp, gpu::BlockDimOp, gpu::BlockIdOp,
                         gpu::GPUFuncOp, gpu::GlobalIdOp, gpu::GridDimOp,
