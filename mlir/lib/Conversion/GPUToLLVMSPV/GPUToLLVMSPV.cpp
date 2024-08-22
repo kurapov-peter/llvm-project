@@ -306,6 +306,70 @@ struct GPUShuffleConversion final : ConvertOpToLLVMPattern<gpu::ShuffleOp> {
   }
 };
 
+class MemorySpaceToOpenCLMemorySpaceConverter : public TypeConverter {
+public:
+  explicit MemorySpaceToOpenCLMemorySpaceConverter() {
+    addConversion([](Type t) { return t; });
+    addConversion(
+        [this](BaseMemRefType memRefType) -> std::optional<Type> {
+          std::optional<gpu::AddressSpace> addrSpace =
+              memorySpaceMap(memRefType.getMemorySpace());
+          if (!addrSpace) {
+            LLVM_DEBUG(
+                llvm::dbgs()
+                << "cannot convert " << memRefType
+                << " due to being unable to find address space in the map\n");
+            return std::nullopt;
+          }
+          auto addrSpaceAttr =
+              gpu::AddressSpaceAttr::get(memRefType.getContext(), *addrSpace);
+          if (auto rankedType = dyn_cast<MemRefType>(memRefType)) {
+            return MemRefType::get(memRefType.getShape(),
+                                   memRefType.getElementType(),
+                                   rankedType.getLayout(), addrSpaceAttr);
+          }
+          return UnrankedMemRefType::get(memRefType.getElementType(),
+                                         addrSpaceAttr);
+        });
+    addConversion([this](FunctionType type) {
+      auto inputs = llvm::map_to_vector(
+          type.getInputs(), [this](Type ty) { return convertType(ty); });
+      auto results = llvm::map_to_vector(
+          type.getResults(), [this](Type ty) { return convertType(ty); });
+      return FunctionType::get(type.getContext(), inputs, results);
+    });
+  }
+
+private:
+  std::optional<gpu::AddressSpace> memorySpaceMap(Attribute memSpaceAttr) {
+    if (!memSpaceAttr)
+      return gpu::AddressSpace::Global;
+    auto gpuAddrSpace = dyn_cast<gpu::AddressSpaceAttr>(memSpaceAttr);
+    if (!gpuAddrSpace)
+      return std::nullopt;
+    return gpuAddrSpace.getValue();
+  }
+};
+
+struct ConvertGpuFunctionSignatures final
+    : public ConvertOpToLLVMPattern<gpu::GPUModuleOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+  LogicalResult
+  matchAndRewrite(gpu::GPUModuleOp m, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const final {
+    MemorySpaceToOpenCLMemorySpaceConverter converter;
+    AttrTypeReplacer replacer;
+    replacer.addReplacement(
+        [&converter](BaseMemRefType origType) -> std::optional<BaseMemRefType> {
+          return converter.convertType<BaseMemRefType>(origType);
+        });
+
+    replacer.recursivelyReplaceElementsIn(m, /*replaceAttrs=*/true,
+                                          /*replaceLocs=*/false,
+                                          /*replaceTypes=*/true);
+  }
+};
+
 struct ConvertGpuSignatureMemrefs final
     : public ConvertOpToLLVMPattern<gpu::GPUFuncOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
@@ -389,21 +453,33 @@ struct GPUToLLVMSPVConversionPass final
     LLVMTypeConverter converter(context, options);
     LLVMConversionTarget target(*context);
 
-    // llvm::errs() << "IR before signature rewriting:\n";
-    // llvm::errs() << getOperation() << "\n";
-    // llvm::errs() << "-----------------------------\n";
+    llvm::errs() << "IR before signature rewriting:\n";
+    llvm::errs() << getOperation() << "\n";
+    llvm::errs() << "-----------------------------\n";
 
     if (forceOpenclAddressSpaces) {
-      RewritePatternSet prepatterns(context);
-      prepatterns.add<ConvertGpuSignatureMemrefs>(converter);
-      if (failed(applyPartialConversion(getOperation(), target,
-                                        std::move(prepatterns))))
-        signalPassFailure();
+      MemorySpaceToOpenCLMemorySpaceConverter converter;
+      AttrTypeReplacer replacer;
+      replacer.addReplacement([&converter](BaseMemRefType origType)
+                                  -> std::optional<BaseMemRefType> {
+        return converter.convertType<BaseMemRefType>(origType);
+      });
+
+      replacer.recursivelyReplaceElementsIn(getOperation(),
+                                            /*replaceAttrs=*/true,
+                                            /*replaceLocs=*/false,
+                                            /*replaceTypes=*/true);
+      // RewritePatternSet prepatterns(context);
+      // // prepatterns.add<ConvertGpuSignatureMemrefs>(converter);
+      // prepatterns.add<ConvertGpuFunctionSignatures>(converter);
+      // if (failed(applyPartialConversion(getOperation(), target,
+      //                                   std::move(prepatterns))))
+      //   signalPassFailure();
     }
 
-    // llvm::errs() << "IR after signature rewriting:\n";
-    // llvm::errs() << getOperation() << "\n";
-    // llvm::errs() << "-----------------------------\n";
+    llvm::errs() << "IR after signature rewriting:\n";
+    llvm::errs() << getOperation() << "\n";
+    llvm::errs() << "-----------------------------\n";
 
     target.addIllegalOp<gpu::BarrierOp, gpu::BlockDimOp, gpu::BlockIdOp,
                         gpu::GPUFuncOp, gpu::GlobalIdOp, gpu::GridDimOp,
