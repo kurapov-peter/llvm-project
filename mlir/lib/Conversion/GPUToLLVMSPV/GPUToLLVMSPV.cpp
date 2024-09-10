@@ -340,6 +340,80 @@ public:
   }
 };
 
+static void
+filterByValRefArgAttrs(FunctionOpInterface funcOp,
+                       SmallVectorImpl<std::optional<NamedAttribute>> &result) {
+  assert(result.empty() && "Unexpected non-empty output");
+  result.resize(funcOp.getNumArguments(), std::nullopt);
+  bool foundByValByRefAttrs = false;
+  for (int argIdx : llvm::seq(funcOp.getNumArguments())) {
+    for (NamedAttribute namedAttr : funcOp.getArgAttrs(argIdx)) {
+      if ((namedAttr.getName() == LLVM::LLVMDialect::getByValAttrName() ||
+           namedAttr.getName() == LLVM::LLVMDialect::getByRefAttrName())) {
+        foundByValByRefAttrs = true;
+        result[argIdx] = namedAttr;
+        break;
+      }
+    }
+  }
+
+  if (!foundByValByRefAttrs)
+    result.clear();
+}
+
+class MyLLVMTypeConverter final : public LLVMTypeConverter {
+public:
+  MyLLVMTypeConverter(MLIRContext *ctx, const LowerToLLVMOptions &options,
+                      const DataLayoutAnalysis *analysis = nullptr)
+      : LLVMTypeConverter(ctx, options, analysis) {}
+
+  Type convertFunctionSignature(FunctionOpInterface funcOp, bool isVariadic,
+                                bool useBarePtrCallConv,
+                                LLVMTypeConverter::SignatureConversion &result,
+                                SmallVectorImpl<std::optional<NamedAttribute>>
+                                    &byValRefNonPtrAttrs) const {
+    filterByValRefArgAttrs(funcOp, byValRefNonPtrAttrs);
+    auto funcTy = cast<FunctionType>(funcOp.getFunctionType());
+
+    // Select the argument converter depending on the calling convention.
+    useBarePtrCallConv = useBarePtrCallConv || options.useBarePtrCallConv;
+    auto funcArgConverter = useBarePtrCallConv ? barePtrFuncArgTypeConverter
+                                               : structFuncArgTypeConverter;
+    // Convert argument types one by one and check for errors.
+    for (auto [idx, type] : llvm::enumerate(funcTy.getInputs())) {
+      SmallVector<Type, 8> converted;
+      if (failed(funcArgConverter(*this, type, converted)))
+        return {};
+
+      // Rewrite converted type of `llvm.byval` or `llvm.byref` function
+      // argument that was not converted to an LLVM pointer types.
+      if (byValRefNonPtrAttrs != nullptr && !byValRefNonPtrAttrs->empty() &&
+          converted.size() == 1 && (*byValRefNonPtrAttrs)[idx].has_value()) {
+        // If the argument was already converted to an LLVM pointer type, we
+        // stop tracking it as it doesn't need more processing.
+        if (isa<LLVM::LLVMPointerType>(converted[0]))
+          (*byValRefNonPtrAttrs)[idx] = std::nullopt;
+        else
+          converted[0] = LLVM::LLVMPointerType::get(&getContext());
+      }
+
+      result.addInputs(idx, converted);
+    }
+
+    // If function does not return anything, create the void result type,
+    // if it returns on element, convert it, otherwise pack the result types
+    // into a struct.
+    Type resultType =
+        funcTy.getNumResults() == 0
+            ? LLVM::LLVMVoidType::get(&getContext())
+            : packFunctionResults(funcTy.getResults(), useBarePtrCallConv);
+    if (!resultType)
+      return {};
+    return LLVM::LLVMFunctionType::get(resultType, result.getConvertedTypes(),
+                                       isVariadic);
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // GPU To LLVM-SPV Pass.
 //===----------------------------------------------------------------------===//
@@ -356,21 +430,52 @@ struct GPUToLLVMSPVConversionPass final
     if (indexBitwidth != kDeriveIndexBitwidthFromDataLayout)
       options.overrideIndexBitwidth(indexBitwidth);
 
-    LLVMTypeConverter converter(context, options);
+    // LLVMTypeConverter converter(context, options);
+    MyLLVMTypeConverter converter(context, options);
     LLVMConversionTarget target(*context);
 
     if (forceOpenclAddressSpaces) {
-      MemorySpaceToOpenCLMemorySpaceConverter converter;
-      AttrTypeReplacer replacer;
-      replacer.addReplacement([&converter](BaseMemRefType origType)
-                                  -> std::optional<BaseMemRefType> {
-        return converter.convertType<BaseMemRefType>(origType);
-      });
+      // MemorySpaceToOpenCLMemorySpaceConverter converter;
+      // AttrTypeReplacer replacer;
+      // replacer.addReplacement([&converter](BaseMemRefType origType)
+      //                             -> std::optional<BaseMemRefType> {
+      //   return converter.convertType<BaseMemRefType>(origType);
+      // });
 
-      replacer.recursivelyReplaceElementsIn(getOperation(),
-                                            /*replaceAttrs=*/true,
-                                            /*replaceLocs=*/false,
-                                            /*replaceTypes=*/true);
+      // replacer.recursivelyReplaceElementsIn(getOperation(),
+      //                                       /*replaceAttrs=*/true,
+      //                                       /*replaceLocs=*/false,
+      //                                       /*replaceTypes=*/true);
+
+      // converter.convertFunctionSignature();
+      // converter.addConversion(
+      //     [](BaseMemRefType memRefType) -> std::optional<Type> {
+      //       // Attach global addr space attribute to memrefs with no addr
+      //       space
+      //       // attr
+      //       Attribute memSpaceAttr = memRefType.getMemorySpace();
+      //       if (memSpaceAttr)
+      //         return std::nullopt;
+
+      //       auto addrSpaceAttr = gpu::AddressSpaceAttr::get(
+      //           memRefType.getContext(), gpu::AddressSpace::Global);
+      //       if (auto rankedType = dyn_cast<MemRefType>(memRefType)) {
+      //         return MemRefType::get(memRefType.getShape(),
+      //                                memRefType.getElementType(),
+      //                                rankedType.getLayout(), addrSpaceAttr);
+      //       }
+      //       return UnrankedMemRefType::get(memRefType.getElementType(),
+      //                                      addrSpaceAttr);
+      //     });
+      converter.addConversion(
+          [&converter](FunctionType type) -> std::optional<Type> {
+            llvm::errs() << "Found a function type: " << type << "\n";
+            return converter.convertType(type);
+          });
+      converter.addConversion([&converter](LLVM::LLVMFunctionType type) {
+        llvm::errs() << "Found an llvm function type: " << type << "\n";
+        return converter.convertType(type);
+      });
     }
 
     target.addIllegalOp<gpu::BarrierOp, gpu::BlockDimOp, gpu::BlockIdOp,
