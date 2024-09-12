@@ -211,4 +211,10 @@ gpu.func @fence() {
   gpu.return
 }
 
+gpu.func @sg_map() {
+  %1 = xegpu.create_nd_tdesc %src[0, 0] : memref<24x32xf32> -> 
+    !xegpu.tensor_desc<8x16xf32, #xegpu.sg_map<wi_layout = [1, 16], wi_data = [1, 1]>>
+  gpu.return
+}
+
 }

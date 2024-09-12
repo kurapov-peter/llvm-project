@@ -1421,4 +1421,16 @@ def ConvertVectorToSPIRV : Pass<"convert-vector-to-spirv"> {
   let dependentDialects = ["spirv::SPIRVDialect"];
 }
 
+//===----------------------------------------------------------------------===//
+// XeGPUToLLVM
+//===----------------------------------------------------------------------===//
+
+def ConvertXeGPUToLLVM : Pass<"convert-xegpu-to-llvm", "ModuleOp"> {
+  let summary = "Convert XeGPU dialect to LLVM dialect";
+  let dependentDialects = [
+    "LLVM::LLVMDialect",
+    "xegpu::XeGPUDialect",
+  ];
+}
+
 #endif // MLIR_CONVERSION_PASSES
