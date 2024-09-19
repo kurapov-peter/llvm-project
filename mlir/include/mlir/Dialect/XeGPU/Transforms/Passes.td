@@ -23,4 +23,8 @@ def XeGPUFoldAliasOps : Pass<"xegpu-fold-alias-ops"> {
   ];
 }
 
+def XeGPUDistributeToWI : Pass<"xegpu-distribute-to-wi"> {
+  let summary = "Distribute SIMD vector ops to SIMT work items";
+}
+
 #endif // MLIR_DIALECT_XEGPU_TRANSFORMS_PASSES_TD
