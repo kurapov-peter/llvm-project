@@ -8,10 +8,18 @@
 
 #include "mlir/Dialect/XeGPU/Transforms/Passes.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/XeGPU/IR/XeGPU.h"
 #include "mlir/Dialect/XeGPU/Transforms/Transforms.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/Support/Debug.h"
+
+#include <deque>
+
+#define DEBUG_TYPE "xegpu-distribute-to-wi"
 
 namespace mlir {
 namespace xegpu {
@@ -158,20 +166,185 @@ StoreDistributor::matchAndRewrite(xegpu::StoreNdOp storeOp,
   return success();
 }
 
-void xegpu::populateXeGPUDistributeToWIPatterns(RewritePatternSet &patterns) {
-  patterns.add<LoadDistributor>(patterns.getContext());
-}
-
 namespace {
 struct XeGPUDistributeToWIPass final
     : public xegpu::impl::XeGPUDistributeToWIBase<XeGPUDistributeToWIPass> {
   void runOnOperation() override;
 };
 
+bool isXeGPUDescProducer(Operation *op) {
+  return isa<xegpu::CreateDescOp>(op) || isa<xegpu::CreateNdDescOp>(op);
+}
+
+struct FuncDistributor final : public OpRewritePattern<func::FuncOp> {
+  FuncDistributor(MLIRContext *ctx, const unsigned subgroup_size = 16)
+      : OpRewritePattern(ctx), subgroupSize(subgroup_size) {}
+
+  LogicalResult matchAndRewrite(func::FuncOp funcOp,
+                                PatternRewriter &rewriter) const override;
+
+private:
+  unsigned subgroupSize;
+};
 } // namespace
+
+LogicalResult
+FuncDistributor::matchAndRewrite(func::FuncOp funcOp,
+                                 PatternRewriter &rewriter) const {
+  // llvm::errs() << "matched function: " << &funcOp << "\n";
+  // llvm::errs().flush();
+  // llvm::errs() << "matched function: " << funcOp.getName() << "\n";
+  // llvm::errs() << "before replacing:\n" << funcOp << "\n";
+
+  // this breaks
+  // auto clonedFuncOp = rewriter.cloneWithoutRegions(funcOp);
+  // std::string clonedFuncOpName = funcOp.getName().str();
+  llvm::errs() << "Matched a function at" << &funcOp << "\n";
+  std::string clonedFuncOpName = "a";
+  auto clonedFuncOp = rewriter.create<func::FuncOp>(
+      funcOp->getLoc(), clonedFuncOpName, funcOp.getFunctionType());
+  SymbolTable::setSymbolVisibility(clonedFuncOp,
+                                   SymbolTable::getSymbolVisibility(funcOp));
+  // for (const auto &namedAttr : funcOp->getAttrs()) {
+  //   clonedFuncOp->setAttr(namedAttr.getName(), namedAttr.getValue());
+  // }
+  assert(clonedFuncOp.getBlocks().size() == 0);
+  Block *entry = clonedFuncOp.addEntryBlock();
+  rewriter.setInsertionPointToStart(entry);
+  Location loc = clonedFuncOp.getLoc();
+  auto c16 = rewriter.create<arith::ConstantIndexOp>(loc, subgroupSize);
+  auto tid = rewriter.create<gpu::ThreadIdOp>(loc, rewriter.getIndexType(),
+                                              gpu::Dimension::x);
+  auto ret = rewriter.create<func::ReturnOp>(loc);
+  rewriter.replaceOp(funcOp, clonedFuncOp);
+  llvm::errs() << "after replacing:\n" << clonedFuncOp << "\n";
+}
+
+void xegpu::populateXeGPUDistributeToWIPatterns(RewritePatternSet &patterns) {
+  // patterns.add<LoadDistributor>(patterns.getContext());
+  patterns.add<FuncDistributor>(patterns.getContext());
+}
+
+// FunctionOpInterface funcOp = getOperation();
+//   IRRewriter builder(funcOp);
+
+//   // we don't have a thread id yet, so create it.
+//   // warp_execute_on_lane0 consumes it's result, so creating it before moving
+//   // the function body into the vector region.
+//   const int64_t subgroupSize = 16; // FIXME
+//   // TODO: move the block instead
+//   // IRMapping mapping;
+//   // funcOp.getFunctionBody().cloneInto(&warpOp.getWarpRegion(), mapping);
+//   // llvm::errs() << "number of blocks in warp region: "
+//   //              << warpOp.getBodyRegion().getBlocks().size() << "\n";
+//   auto clonedFuncOp = funcOp.clone();
+//   clonedFuncOp.eraseBody();
+//   Location loc = clonedFuncOp->getLoc();
+//   Block *entry = clonedFuncOp.addEntryBlock();
+//   builder.setInsertionPointToStart(entry);
+//   auto c16 = builder.create<arith::ConstantIndexOp>(loc, subgroupSize);
+//   auto tid = builder.create<gpu::ThreadIdOp>(loc, builder.getIndexType(),
+//                                              gpu::Dimension::x);
+//   auto warpOp = builder.create<vector::WarpExecuteOnLane0Op>(
+//       loc, TypeRange(), tid.getResult(), subgroupSize);
+//   SmallVector<Type> argsTypes(warpOp.getBody()->getArgumentTypes());
+//   unsigned numArgs = warpOp.getBody()->getNumArguments();
+//   auto ret = builder.create<func::ReturnOp>(loc);
+
+//   llvm::errs() << "deduced argument types: " << argsTypes << "\n";
+
+//   // Restore the block and its arguments for the warp region
+//   // builder.mergeBlocks(&funcOp.getFunctionBody().getBlocks().front(),
+//   //                     warpOp.getBody());
+//   // auto argsTypes = warpOp.getBody()->getArgumentTypes();
+//   // warpOp.getBodyRegion().getBlocks().pop_front();
+//   // assert(warpOp.getBody() && "getBody() returned null");
+//   // unsigned numArgs = warpOp.getBody()->getNumArguments();
+//   // warpOp.getBody()->eraseArguments(0, numArgs);
+//   // warpOp.getBody()->addArguments(argsTypes,
+//   //                                SmallVector<Location>(argsTypes.size(),
+//   //                                loc));
+//   llvm::errs() << "before cloning: " << clonedFuncOp << "\n";
+//   llvm::errs() << "before cloning: " << warpOp << "\n";
+
+//   warpOp.getWarpRegion().takeBody(funcOp.getFunctionBody());
+//   Block *body = &funcOp.getFunctionBody().emplaceBlock();
+//   llvm::errs() << "newly created block has " << body->getArguments().size()
+//                << " arguments\n";
+//   body->eraseArguments(0, body->getArguments().size());
+//   body->addArguments(argsTypes,
+//                      SmallVector<Location>(argsTypes.size(),
+//                      warpOp.getLoc()));
+
+//   llvm::errs() << "after cloning: " << clonedFuncOp << "\n";
+//   llvm::errs() << "after cloning: " << warpOp << "\n";
+
+//   warpOp.getBodyRegion().getBlocks().back().back().erase();
+//   //
+//   builder.setInsertionPointToEnd(&warpOp.getWarpRegion().getBlocks().back());
+//   // builder.create<vector::YieldOp>(loc);
+//   // builder.setInsertionPointToEnd(body);
+//   // builder.create<vector::YieldOp>(loc);
+
+//   // builder.replaceOpWithNewOp<vector::YieldOp>(&body->back());
+
+//   // llvm::errs() << "after replacing terminator: " << clonedFuncOp << "\n";
+//   // llvm::errs() << "after replacing terminator: " << warpOp << "\n";
+
+//   // llvm::errs() << "after restoring the vector block: " << warpOp << "\n";
+
+//   // Restore the function body
+//   // funcOp.eraseBody();
+//   // Block *entry = funcOp.addEntryBlock();
+//   // llvm::errs() << "created a new entry block: " << *entry << "\n";
+
+//   // builder.setInsertionPointToStart(entry);
+//   // auto c16 = builder.create<arith::ConstantIndexOp>(loc, subgroupSize);
+
+//   // tid->moveAfter(c16);
+//   // warpOp->moveAfter(tid);
+//   // tid->moveBefore(&entry, entry.end());
+//   // warpOp->moveBefore(&entry, entry.end());
+
+//   llvm::errs() << "---------------------" << "\n";
+//   llvm::errs() << "IR before hoisting: " << clonedFuncOp << "\n";
+//   // Hoist all the non-distributable ops out of the vector distribution
+//   region
+
+//   builder.replaceOp(funcOp, clonedFuncOp);
 
 void XeGPUDistributeToWIPass::runOnOperation() {
   RewritePatternSet patterns(&getContext());
   xegpu::populateXeGPUDistributeToWIPatterns(patterns);
-  (void)applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
+  auto config = GreedyRewriteConfig();
+  config.maxIterations = 2;
+  (void)applyPatternsAndFoldGreedily(getOperation(), std::move(patterns),
+                                     config);
+  llvm::errs() << "Finished applying the pattern\n";
+  llvm::errs() << getOperation() << "\n";
+  // todo: another option is walking:
+  // PatternRewriter rewriter(&getContext());
+
+  // // 1. Get all the producers of tensor_desc.
+  // //    - add all uses to the distribution list.
+  // // 2. Walk through def-use chains and distribute all the ops (?)
+  // auto root = getOperation();
+  // std::deque<Operation *> distributionQueue;
+  // root->walk([&](Operation *op) {
+  //   if (isXeGPUDescProducer(op)) {
+  //     distributionQueue.push_back(op);
+  //   }
+  // });
+
+  // while (!distributionQueue.empty()) {
+  //   Operation *op = distributionQueue.front();
+  //   distributionQueue.pop_front();
+
+  //   assert(op && "op is null");
+
+  //   if (isXeGPUDescProducer(op)) {
+  //     distributionQueue.emplace_back(op->getUses());
+  //     continue;
+  //   }
+  // }
 }
