@@ -195,6 +195,14 @@ struct DescriptorHoister final
                                 PatternRewriter &rewriter) const override;
 };
 
+// A version that drops arguments
+struct DescriptorHoister2 final
+    : public OpRewritePattern<vector::WarpExecuteOnLane0Op> {
+  using OpRewritePattern<vector::WarpExecuteOnLane0Op>::OpRewritePattern;
+  LogicalResult matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
+                                PatternRewriter &rewriter) const override;
+};
+
 struct DescriptorSinker final
     : public OpRewritePattern<vector::WarpExecuteOnLane0Op> {
   using OpRewritePattern<vector::WarpExecuteOnLane0Op>::OpRewritePattern;
@@ -439,6 +447,33 @@ struct WarpOpElementwise
     return success();
   }
 };
+struct WarpOpConstant : public OpRewritePattern<vector::WarpExecuteOnLane0Op> {
+  using OpRewritePattern<vector::WarpExecuteOnLane0Op>::OpRewritePattern;
+  LogicalResult matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
+                                PatternRewriter &rewriter) const override {
+    OpOperand *yieldOperand =
+        getWarpResult(warpOp, llvm::IsaPred<arith::ConstantOp>);
+    if (!yieldOperand)
+      return failure();
+    auto constantOp = yieldOperand->get().getDefiningOp<arith::ConstantOp>();
+    auto dense = dyn_cast<SplatElementsAttr>(constantOp.getValue());
+    if (!dense)
+      return failure();
+    // Notify the rewriter that the warp op is changing (see the comment on
+    // the WarpOpTransferRead pattern).
+    rewriter.startOpModification(warpOp);
+    unsigned operandIndex = yieldOperand->getOperandNumber();
+    Attribute scalarAttr = dense.getSplatValue<Attribute>();
+    auto newAttr = DenseElementsAttr::get(
+        cast<ShapedType>(warpOp.getResult(operandIndex).getType()), scalarAttr);
+    Location loc = warpOp.getLoc();
+    rewriter.setInsertionPointAfter(warpOp);
+    Value distConstant = rewriter.create<arith::ConstantOp>(loc, newAttr);
+    rewriter.replaceAllUsesWith(warpOp.getResult(operandIndex), distConstant);
+    rewriter.finalizeOpModification(warpOp);
+    return success();
+  }
+};
 struct WarpOpForwardOperand
     : public OpRewritePattern<vector::WarpExecuteOnLane0Op> {
   using OpRewritePattern<vector::WarpExecuteOnLane0Op>::OpRewritePattern;
@@ -480,6 +515,131 @@ struct WarpOpForwardOperand
     rewriter.startOpModification(warpOp);
     rewriter.replaceAllUsesWith(warpOp.getResult(resultIndex), valForwarded);
     rewriter.finalizeOpModification(warpOp);
+    return success();
+  }
+};
+struct WarpOpDeadResult
+    : public OpRewritePattern<vector::WarpExecuteOnLane0Op> {
+  using OpRewritePattern<vector::WarpExecuteOnLane0Op>::OpRewritePattern;
+  LogicalResult matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
+                                PatternRewriter &rewriter) const override {
+    SmallVector<Type> newResultTypes;
+    newResultTypes.reserve(warpOp->getNumResults());
+    SmallVector<Value> newYieldValues;
+    newYieldValues.reserve(warpOp->getNumResults());
+    DenseMap<Value, int64_t> dedupYieldOperandPositionMap;
+    DenseMap<OpResult, int64_t> dedupResultPositionMap;
+    auto yield = cast<vector::YieldOp>(
+        warpOp.getBodyRegion().getBlocks().begin()->getTerminator());
+
+    // Some values may be yielded multiple times and correspond to multiple
+    // results. Deduplicating occurs by taking each result with its matching
+    // yielded value, and:
+    //   1. recording the unique first position at which the value is yielded.
+    //   2. recording for the result, the first position at which the dedup'ed
+    //      value is yielded.
+    //   3. skipping from the new result types / new yielded values any result
+    //      that has no use or whose yielded value has already been seen.
+    for (OpResult result : warpOp.getResults()) {
+      Value yieldOperand = yield.getOperand(result.getResultNumber());
+      auto it = dedupYieldOperandPositionMap.insert(
+          std::make_pair(yieldOperand, newResultTypes.size()));
+      dedupResultPositionMap.insert(std::make_pair(result, it.first->second));
+      if (result.use_empty() || !it.second)
+        continue;
+      newResultTypes.push_back(result.getType());
+      newYieldValues.push_back(yieldOperand);
+    }
+    // No modification, exit early.
+    if (yield.getNumOperands() == newYieldValues.size())
+      return failure();
+    // Move the body of the old warpOp to a new warpOp.
+    vector::WarpExecuteOnLane0Op newWarpOp =
+        moveRegionToNewWarpOpAndReplaceReturns(rewriter, warpOp, newYieldValues,
+                                               newResultTypes);
+
+    // Simplify the new warp op after dropping dead results.
+    newWarpOp.getBody()->walk([&](Operation *op) {
+      if (isOpTriviallyDead(op))
+        rewriter.eraseOp(op);
+      else {
+        auto load = dyn_cast<xegpu::LoadNdOp>(op);
+        if (load) {
+          DBGS() << "Found a non-dead op: " << load << "\n";
+          DBGS() << "use_empty() = " << load->use_empty() << "\n";
+          DBGS() << "is op trivially dead: " << isOpTriviallyDead(load) << "\n";
+          SmallVector<Operation *, 1> effectingOps(1, load);
+          while (!effectingOps.empty()) {
+            Operation *op = effectingOps.pop_back_val();
+
+            // If the operation has recursive effects, push all of the nested
+            // operations on to the stack to consider.
+            bool hasRecursiveEffects =
+                op->hasTrait<OpTrait::HasRecursiveMemoryEffects>();
+            if (hasRecursiveEffects) {
+              for (Region &region : op->getRegions()) {
+                for (auto &block : region) {
+                  for (auto &nestedOp : block)
+                    effectingOps.push_back(&nestedOp);
+                }
+              }
+            }
+            if (auto effectInterface = dyn_cast<MemoryEffectOpInterface>(op)) {
+              // Check to see if this op either has no effects, or only
+              // allocates/reads memory.
+              SmallVector<MemoryEffects::EffectInstance, 1> effects;
+              effectInterface.getEffects(effects);
+              DBGS() << "The load has memory effects\n";
+              // Gather all results of this op that are allocated.
+              SmallPtrSet<Value, 4> allocResults;
+              for (const MemoryEffects::EffectInstance &it : effects)
+                if (isa<MemoryEffects::Allocate>(it.getEffect()) &&
+                    it.getValue() && it.getValue().getDefiningOp() == op)
+                  allocResults.insert(it.getValue());
+
+              DBGS() << "alloc results size: " << allocResults.size() << "\n";
+              if (!llvm::all_of(effects, [&allocResults](
+                                             const MemoryEffects::EffectInstance
+                                                 &it) {
+                    // We can drop effects if the value is an allocation and
+                    // is a result of the operation.
+                    if (allocResults.contains(it.getValue())) {
+                      DBGS() << "we can drop effects since the value is an "
+                                "allocation and is a result of the operation\n";
+                      return false;
+                    }
+                    // Otherwise, the effect must be a read.
+                    DBGS() << "The effect must be a read, it is: "
+                           << isa<MemoryEffects::Read>(it.getEffect()) << "\n";
+                    return isa<MemoryEffects::Read>(it.getEffect());
+                  })) {
+                DBGS() << "not all conditions met\n";
+              }
+            }
+            if (hasRecursiveEffects)
+              continue;
+
+            // If there were no effect interfaces, we treat this op as
+            // conservatively having effects.
+            // return false;
+            DBGS() << "Treating op as conservatively having effects\n";
+            break;
+          }
+        }
+      }
+    });
+
+    // Replace results of the old warpOp by the new, deduplicated results.
+    SmallVector<Value> newValues;
+    newValues.reserve(warpOp->getNumResults());
+    for (OpResult result : warpOp.getResults()) {
+      if (result.use_empty())
+        newValues.push_back(Value());
+      else
+        newValues.push_back(
+            newWarpOp.getResult(dedupResultPositionMap.lookup(result)));
+    }
+    rewriter.replaceOp(warpOp, newValues);
     return success();
   }
 };
@@ -576,6 +736,63 @@ DescriptorSinker::matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
 }
 
 LogicalResult
+DescriptorHoister2::matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
+                                    PatternRewriter &rewriter) const {
+  auto [blockArg, descPtr] =
+      getWarpArgument(warpOp, llvm::IsaPred<xegpu::CreateNdDescOp>);
+  if (!blockArg)
+    return failure();
+  assert(descPtr && "Descriptor ptr must be non-null");
+  auto desc = dyn_cast<xegpu::CreateNdDescOp>(descPtr);
+  assert(desc && "Descriptor must be non-null");
+
+  // If the descriptor points to the block argument, a hoisted descriptor
+  // should take function argument as its operand
+  auto funcOp = warpOp->getParentOfType<func::FuncOp>();
+  BlockArgument argument = dyn_cast<BlockArgument>(desc.getSource());
+  assert(argument && "desc source must be a block argument");
+  unsigned warpBlockArgNum = argument.getArgNumber();
+
+  DBGS() << "Operand: " << warpOp.getArgs()[argument.getArgNumber()] << "\n";
+  auto funcArg =
+      warpOp.getArgs()[argument.getArgNumber()].dyn_cast<BlockArgument>();
+  assert(funcArg && "func arg must not be null");
+  DBGS() << "Source for the argument at pos " << argument.getArgNumber()
+         << " : " << warpOp.getArgs()[argument.getArgNumber()] << "\n";
+  rewriter.setInsertionPoint(warpOp);
+
+  DBGS() << "func's argument for block arg: "
+         << warpOp.getArgs()[argument.getArgNumber()].getDefiningOp() << "\n";
+  auto srcTypedVal = dyn_cast<TypedValue<MemRefType>>(
+      funcOp.getFunctionBody().getArgument(funcArg.getArgNumber()));
+  auto srcType = srcTypedVal.getType();
+  DBGS() << "src type rank: " << srcType.getRank() << "\n";
+  DBGS() << "offsets size: " << getAsOpFoldResult(desc.getOffsets()).size()
+         << "\n";
+  DBGS() << "original offsets:\n";
+  llvm::interleaveComma(desc.getConstOffsets(), DBGS());
+  DBGS() << "\nend of original offsets.\n";
+
+  auto newDescOp =
+      cast<xegpu::CreateNdDescOp>(rewriter.clone(*desc.getOperation()));
+
+  newDescOp.getSourceMutable().assign(
+      funcOp.getFunctionBody().getArgument(funcArg.getArgNumber()));
+  DBGS() << "Inserted a hoisted descriptor op:\n" << funcOp << "\n";
+  DBGS() << "End of func with hoisted desc op:\n";
+
+  rewriter.startOpModification(warpOp);
+  rewriter.replaceAllUsesWith(desc, newDescOp);
+  rewriter.eraseOp(desc);
+  warpOp.getArgsMutable().erase(argument.getArgNumber());
+  warpOp.getBody()->eraseArgument(argument.getArgNumber());
+  DBGS() << "After replacing uses:\n" << funcOp << "\n";
+  rewriter.finalizeOpModification(warpOp);
+
+  return success();
+}
+
+LogicalResult
 DescriptorHoister::matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
                                    PatternRewriter &rewriter) const {
   auto [blockArg, descPtr] =
@@ -642,9 +859,9 @@ LogicalResult WarpOpLoadNd::matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
   auto loadOp = operand->get().getDefiningOp<xegpu::LoadNdOp>();
   DBGS() << "Found a suitable load for distribution: " << loadOp << "\n";
 
-  // if (!warpOp.isDefinedOutsideOfRegion(loadOp.getTensorDesc()))
-  //   return rewriter.notifyMatchFailure(
-  //       loadOp, "source must be defined outside of the region");
+  if (!warpOp.isDefinedOutsideOfRegion(loadOp.getTensorDesc()))
+    return rewriter.notifyMatchFailure(
+        loadOp, "source must be defined outside of the region");
 
   xegpu::TensorDescType origType = loadOp.getTensorDescType();
   xegpu::SGMapAttr sgMap = origType.getSGMapAttr();
@@ -679,27 +896,34 @@ LogicalResult WarpOpLoadNd::matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
       distributedResultShape, loadOp.getType().getElementType(),
       loadOp.getType().getScalableDims());
 
+  unsigned operandIdx = operand->getOperandNumber();
+
   SmallVector<size_t> newRetIndices;
   vector::WarpExecuteOnLane0Op newWarpOp =
       moveRegionToNewWarpOpAndAppendReturns(
           rewriter, warpOp, loadOp.getTensorDesc(), loadOp.getTensorDescType(),
           newRetIndices);
 
+  DBGS() << "New warp op:\n" << newWarpOp << "\n";
   DBGS() << "Return indices:\n";
   llvm::interleaveComma(newRetIndices, DBGS());
   DBGS() << "\nEnd of indices:\n";
 
   rewriter.setInsertionPointAfter(newWarpOp);
-  auto newLoadOp =
-      cast<xegpu::LoadNdOp>(rewriter.clone(*loadOp.getOperation()));
-  rewriter.eraseOp(loadOp);
-  newLoadOp.getTensorDescMutable().assign(
-      newWarpOp.getResult(newRetIndices[0]));
+  // auto newLoadOp =
+  //     cast<xegpu::LoadNdOp>(rewriter.clone(*loadOp.getOperation()));
+  auto newLoadOp = rewriter.create<xegpu::LoadNdOp>(
+      loadOp.getLoc(), distributedVectorType, loadOp.getTensorDesc(),
+      loadOp.getPackedAttr(), loadOp.getTransposeAttr(), loadOp.getL1HintAttr(),
+      loadOp.getL2HintAttr(), loadOp.getL3HintAttr());
 
-  DBGS() << "IR after store distribution:\n" << newWarpOp << "\n";
-  DBGS() << "IR after store distribution:\n"
+  DBGS() << "IR after load distribution:\n" << newWarpOp << "\n";
+  DBGS() << "IR after load distribution:\n"
          << newWarpOp.getOperation()->getParentOfType<func::FuncOp>() << "\n";
 
+  // this makes the load feeding into yield dead
+  Value distributedVal = newWarpOp.getResult(operandIdx);
+  rewriter.replaceAllUsesWith(distributedVal, newLoadOp);
   return success();
 }
 
@@ -747,10 +971,13 @@ FuncDistributor::matchAndRewrite(func::FuncOp funcOp,
 void xegpu::populateXeGPUDistributeToWIPatterns(RewritePatternSet &patterns) {
   // patterns.add<LoadDistributor>(patterns.getContext());
   patterns.add<FuncDistributor>(patterns.getContext());
-  patterns.add<DescriptorHoister>(patterns.getContext());
+  patterns.add<DescriptorHoister2>(patterns.getContext());
   patterns.add<WarpOpStoreNd>(patterns.getContext());
   patterns.add<WarpOpLoadNd>(patterns.getContext());
-  // patterns.add<WarpOpElementwise>(patterns.getContext());
+  patterns.add<WarpOpDeadResult>(patterns.getContext());
+  patterns.add<WarpOpForwardOperand>(patterns.getContext());
+  patterns.add<WarpOpElementwise>(patterns.getContext());
+  patterns.add<WarpOpConstant>(patterns.getContext());
 }
 
 // FunctionOpInterface funcOp = getOperation();

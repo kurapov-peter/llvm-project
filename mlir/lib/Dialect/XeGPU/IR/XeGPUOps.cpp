@@ -248,6 +248,14 @@ LogicalResult LoadNdOp::verify() {
   return success();
 }
 
+void LoadNdOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  if (llvm::isa<TensorDescType>(getTensorDescType()))
+    effects.emplace_back(MemoryEffects::Read::get(), &getTensorDescMutable(),
+                         SideEffects::DefaultResource::get());
+}
+
 //===----------------------------------------------------------------------===//
 // XeGPU_StoreNdOp
 //===----------------------------------------------------------------------===//
