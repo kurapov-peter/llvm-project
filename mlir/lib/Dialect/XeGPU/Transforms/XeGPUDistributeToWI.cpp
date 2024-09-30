@@ -195,6 +195,13 @@ struct DescriptorHoister final
                                 PatternRewriter &rewriter) const override;
 };
 
+struct DescriptorSinker final
+    : public OpRewritePattern<vector::WarpExecuteOnLane0Op> {
+  using OpRewritePattern<vector::WarpExecuteOnLane0Op>::OpRewritePattern;
+  LogicalResult matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
+                                PatternRewriter &rewriter) const override;
+};
+
 struct WarpOpStoreNd final
     : public OpRewritePattern<vector::WarpExecuteOnLane0Op> {
   using OpRewritePattern<vector::WarpExecuteOnLane0Op>::OpRewritePattern;
@@ -261,6 +268,8 @@ vector::WarpExecuteOnLane0Op moveRegionToNewWarpOpAndReplaceInputs(
       warpOp.getLoc(), warpOp.getResultTypes(), warpOp.getLaneid(),
       warpOp.getWarpSize(), newArgumentValues, newArgumentTypes);
 
+  DBGS() << "New empty warp op: " << newWarpOp << "\n";
+
   Region &opBody = warpOp.getBodyRegion();
   Region &newOpBody = newWarpOp.getBodyRegion();
   Block &newOpFirstBlock = newOpBody.front();
@@ -268,6 +277,18 @@ vector::WarpExecuteOnLane0Op moveRegionToNewWarpOpAndReplaceInputs(
   rewriter.eraseBlock(&newOpFirstBlock);
   assert(newWarpOp.getWarpRegion().hasOneBlock() &&
          "expected WarpOp with single block");
+
+  rewriter.modifyOpInPlace(newWarpOp, [&]() {
+    newWarpOp.getBody()->eraseArguments(0,
+                                        newWarpOp.getBody()->getNumArguments());
+    newWarpOp.getBody()->addArguments(
+        newArgumentTypes,
+        SmallVector<Location>(newArgumentTypes.size(), newWarpOp.getLoc()));
+    newWarpOp.getArgsMutable();
+  });
+
+  DBGS() << "New warp op with rewritten block arguments:\n"
+         << newWarpOp << "\n";
 
   return newWarpOp;
 }
@@ -295,6 +316,7 @@ vector::WarpExecuteOnLane0Op moveRegionToNewWarpOpAndRewriteInputs(
     }
   }
   args.insert(newInputValues.begin(), newInputValues.end());
+  DBGS() << "Creating a new warp op\nArgument types:\n" << types << "\n";
   vector::WarpExecuteOnLane0Op newWarpOp =
       moveRegionToNewWarpOpAndReplaceInputs(rewriter, warpOp,
                                             args.getArrayRef(), types);
@@ -352,6 +374,17 @@ static OpOperand *getWarpResult(vector::WarpExecuteOnLane0Op warpOp,
     }
   }
   return {};
+}
+static std::pair<BlockArgument *, Operation *>
+getWarpArgument(vector::WarpExecuteOnLane0Op warpOp,
+                const std::function<bool(Operation *)> &fn) {
+  for (BlockArgument &arg : warpOp.getBody()->getArguments()) {
+    for (Operation *user : arg.getUsers()) {
+      if (user && fn(user))
+        return {&arg, user};
+    }
+  }
+  return {nullptr, nullptr};
 }
 struct WarpOpElementwise
     : public OpRewritePattern<vector::WarpExecuteOnLane0Op> {
@@ -519,8 +552,11 @@ WarpOpStoreNd::matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
 }
 
 LogicalResult
-DescriptorHoister::matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
-                                   PatternRewriter &rewriter) const {
+DescriptorSinker::matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
+                                  PatternRewriter &rewriter) const {
+  // TODO: sinking is a cheaper way of moving out the descriptor since:
+  // a. it doesn't need iteration through all the argument uses
+  // b. no signature rewriters are necessary
   OpOperand *yieldOperand =
       getWarpResult(warpOp, llvm::IsaPred<xegpu::CreateNdDescOp>);
   if (!yieldOperand)
@@ -535,9 +571,23 @@ DescriptorHoister::matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
 
   if (!argSrc)
     return failure();
+  assert(false && "not implemented");
+  return failure();
+}
 
-  // If the descriptor points to the block argument, a hoisted descriptor should
-  // take function argument as its operand
+LogicalResult
+DescriptorHoister::matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
+                                   PatternRewriter &rewriter) const {
+  auto [blockArg, descPtr] =
+      getWarpArgument(warpOp, llvm::IsaPred<xegpu::CreateNdDescOp>);
+  if (!blockArg)
+    return failure();
+  assert(descPtr && "Descriptor ptr must be non-null");
+  auto desc = dyn_cast<xegpu::CreateNdDescOp>(descPtr);
+  assert(desc && "Descriptor must be non-null");
+
+  // If the descriptor points to the block argument, a hoisted descriptor
+  // should take function argument as its operand
   auto funcOp = warpOp->getParentOfType<func::FuncOp>();
   BlockArgument argument = dyn_cast<BlockArgument>(desc.getSource());
   assert(argument && "desc source must be a block argument");
@@ -545,13 +595,6 @@ DescriptorHoister::matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
   DBGS() << "Source for the argument at pos " << argument.getArgNumber()
          << " : " << warpOp.getArgs()[argument.getArgNumber()] << "\n";
   rewriter.setInsertionPoint(warpOp);
-  // Type tdesc, TypedValue<IntegerType>  source, llvm::ArrayRef<OpFoldResult>
-  // offsets, llvm::ArrayRef<OpFoldResult> shape, llvm::ArrayRef<OpFoldResult>
-  // strides
-
-  DBGS() << "Folded offsets:\n";
-  llvm::interleaveComma(getAsOpFoldResult(desc.getOffsets()), DBGS());
-  DBGS() << "End of folded offsets.\n";
 
   auto srcTypedVal = dyn_cast<TypedValue<MemRefType>>(
       funcOp.getFunctionBody().getArgument(argument.getArgNumber()));
@@ -562,33 +605,26 @@ DescriptorHoister::matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
   DBGS() << "original offsets:\n";
   llvm::interleaveComma(desc.getConstOffsets(), DBGS());
   DBGS() << "end of original offsets.\n";
-  // void CreateNdDescOp::build(OpBuilder &builder, OperationState &state,
-  //  Type tdesc, TypedValue<IntegerType> source,
-  //  llvm::ArrayRef<OpFoldResult> offsets,
-  //  llvm::ArrayRef<OpFoldResult> shape,
-  //  llvm::ArrayRef<OpFoldResult> strides)
-  // void CreateNdDescOp::build(OpBuilder &builder, OperationState &state,
-  //  Type tdesc, TypedValue<MemRefType> source,
-  //  llvm::ArrayRef<OpFoldResult> offsets
-  // TODO: this needs much better support from constructors
-  auto newDescOp = rewriter.create<xegpu::CreateNdDescOp>(
-      desc.getLoc(), desc.getTensorDesc().getType(),
-      dyn_cast<TypedValue<MemRefType>>(
-          funcOp.getFunctionBody().getArgument(argument.getArgNumber())),
-      DenseI64ArrayAttr::get(rewriter.getContext(), desc.getConstOffsets()));
 
+  auto newDescOp =
+      cast<xegpu::CreateNdDescOp>(rewriter.clone(*desc.getOperation()));
+
+  newDescOp.getSourceMutable().assign(
+      funcOp.getFunctionBody().getArgument(argument.getArgNumber()));
   DBGS() << "Inserted a hoisted descriptor op:\n" << funcOp << "\n";
   DBGS() << "End of func with hoisted desc op:\n";
 
-  SmallVector<Value> additionalArgs({newDescOp.getResult()});
-  SmallVector<Type> additionalTypes({desc.getResult().getType()});
-  SmallVector<size_t> newArgIndices;
-  vector::WarpExecuteOnLane0Op newWarpOp =
-      moveRegionToNewWarpOpAndRewriteInputs(rewriter, warpOp, additionalArgs,
-                                            additionalTypes, newArgIndices);
-  // if (!warpOp.isDefinedOutsideOfRegion(desc.getSource()) && !argSrc)
-  //   return rewriter.notifyMatchFailure(
-  //       desc, "source must be defined outside of the region");
+  rewriter.startOpModification(warpOp);
+  warpOp.getArgsMutable().append(newDescOp.getResult());
+  BlockArgument newArg =
+      warpOp.getBody()->addArgument(newDescOp.getType(), newDescOp.getLoc());
+  DBGS() << "After updating args:\n" << funcOp << "\n";
+  rewriter.replaceAllUsesWith(desc, newArg);
+  rewriter.eraseOp(desc);
+  warpOp.getArgsMutable().erase(argument.getArgNumber());
+  warpOp.getBody()->eraseArgument(argument.getArgNumber());
+  DBGS() << "After replacing uses:\n" << funcOp << "\n";
+  rewriter.finalizeOpModification(warpOp);
 
   return success();
 }
@@ -603,9 +639,68 @@ LogicalResult WarpOpLoadNd::matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
   if (!operand)
     return rewriter.notifyMatchFailure(warpOp,
                                        "warp result is not a xegpu::LoadNd op");
-  auto load = operand->get().getDefiningOp<xegpu::LoadNdOp>();
-  DBGS() << "Found a suitable load for distribution: " << load << "\n";
-  return failure();
+  auto loadOp = operand->get().getDefiningOp<xegpu::LoadNdOp>();
+  DBGS() << "Found a suitable load for distribution: " << loadOp << "\n";
+
+  // if (!warpOp.isDefinedOutsideOfRegion(loadOp.getTensorDesc()))
+  //   return rewriter.notifyMatchFailure(
+  //       loadOp, "source must be defined outside of the region");
+
+  xegpu::TensorDescType origType = loadOp.getTensorDescType();
+  xegpu::SGMapAttr sgMap = origType.getSGMapAttr();
+  if (!sgMap)
+    return rewriter.notifyMatchFailure(
+        loadOp, "the source tensor descriptor lacks sg_map attribute");
+
+  auto origShape = origType.getShape();
+  if (origShape.size() != 2)
+    return rewriter.notifyMatchFailure(loadOp, "unsupported shape");
+
+  llvm::SmallVector<int64_t, 2> distributedResultShape;
+  auto layout = sgMap.getWiLayout();
+  auto outputVectorShape = loadOp.getType().getShape();
+
+  for (const auto [l, o, v] : llvm::zip(layout, origShape, outputVectorShape)) {
+    if (!divisible(APInt(64, o), APInt(64, l)))
+      return rewriter.notifyMatchFailure(
+          loadOp,
+          "the tensor dimentions are not divisible by the distribution factor");
+    if (!divisible(APInt(64, v), APInt(64, l)))
+      return rewriter.notifyMatchFailure(
+          loadOp, "the output vector dimentions are not divisible by the "
+                  "distribution factor");
+    distributedResultShape.push_back(v / l);
+  }
+
+  if (loadOp.getPacked())
+    distributedResultShape.push_back(outputVectorShape.back());
+
+  auto distributedVectorType = mlir::VectorType::get(
+      distributedResultShape, loadOp.getType().getElementType(),
+      loadOp.getType().getScalableDims());
+
+  SmallVector<size_t> newRetIndices;
+  vector::WarpExecuteOnLane0Op newWarpOp =
+      moveRegionToNewWarpOpAndAppendReturns(
+          rewriter, warpOp, loadOp.getTensorDesc(), loadOp.getTensorDescType(),
+          newRetIndices);
+
+  DBGS() << "Return indices:\n";
+  llvm::interleaveComma(newRetIndices, DBGS());
+  DBGS() << "\nEnd of indices:\n";
+
+  rewriter.setInsertionPointAfter(newWarpOp);
+  auto newLoadOp =
+      cast<xegpu::LoadNdOp>(rewriter.clone(*loadOp.getOperation()));
+  rewriter.eraseOp(loadOp);
+  newLoadOp.getTensorDescMutable().assign(
+      newWarpOp.getResult(newRetIndices[0]));
+
+  DBGS() << "IR after store distribution:\n" << newWarpOp << "\n";
+  DBGS() << "IR after store distribution:\n"
+         << newWarpOp.getOperation()->getParentOfType<func::FuncOp>() << "\n";
+
+  return success();
 }
 
 LogicalResult
