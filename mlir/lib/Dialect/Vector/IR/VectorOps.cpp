@@ -6469,33 +6469,35 @@ static LogicalResult verifyDistributedType(Type expanded, Type distributed,
   // If the types matches there is no distribution.
   if (expanded == distributed)
     return success();
-  auto expandedVecType = llvm::dyn_cast<VectorType>(expanded);
-  auto distributedVecType = llvm::dyn_cast<VectorType>(distributed);
-  if (!expandedVecType || !distributedVecType)
-    return op->emitOpError("expected vector type for distributed operands.");
-  if (expandedVecType.getRank() != distributedVecType.getRank() ||
-      expandedVecType.getElementType() != distributedVecType.getElementType())
-    return op->emitOpError(
-        "expected distributed vectors to have same rank and element type.");
+  auto expandedShapedType = llvm::dyn_cast<ShapedType>(expanded);
+  auto distributedShapedType = llvm::dyn_cast<ShapedType>(distributed);
+  if (!expandedShapedType || !distributedShapedType)
+    return op->emitOpError("expected shaped type for distributed operands.");
+  if (expandedShapedType.getRank() != distributedShapedType.getRank() ||
+      expandedShapedType.getElementType() !=
+          distributedShapedType.getElementType())
+    return op->emitOpError("expected distributed shaped types to have same "
+                           "rank and element type.");
 
-  SmallVector<int64_t> scales(expandedVecType.getRank(), 1);
-  for (int64_t i = 0, e = expandedVecType.getRank(); i < e; i++) {
-    int64_t eDim = expandedVecType.getDimSize(i);
-    int64_t dDim = distributedVecType.getDimSize(i);
+  SmallVector<int64_t> scales(expandedShapedType.getRank(), 1);
+  for (int64_t i = 0, e = expandedShapedType.getRank(); i < e; i++) {
+    int64_t eDim = expandedShapedType.getDimSize(i);
+    int64_t dDim = distributedShapedType.getDimSize(i);
     if (eDim == dDim)
       continue;
     if (eDim % dDim != 0)
       return op->emitOpError()
-             << "expected expanded vector dimension #" << i << " (" << eDim
-             << ") to be a multipler of the distributed vector dimension ("
+             << "expected expanded type dimension #" << i << " (" << eDim
+             << ") to be a multipler of the distributed type dimension ("
              << dDim << ")";
     scales[i] = eDim / dDim;
   }
   if (std::accumulate(scales.begin(), scales.end(), 1,
                       std::multiplies<int64_t>()) != warpSize)
     return op->emitOpError()
-           << "incompatible distribution dimensions from " << expandedVecType
-           << " to " << distributedVecType << " with warp size = " << warpSize;
+           << "incompatible distribution dimensions from " << expandedShapedType
+           << " to " << distributedShapedType
+           << " with warp size = " << warpSize;
 
   return success();
 }
