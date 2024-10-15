@@ -1072,42 +1072,9 @@ WarpOpTensorDescOp::matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
   auto xDim =
       rewriter.create<arith::ConstantIndexOp>(laneid.getLoc(), layout[0]);
   auto offset_x =
-      rewriter.create<arith::DivUIOp>(laneid.getLoc(), laneid, xDim);
-  auto offset_y =
       rewriter.create<arith::RemUIOp>(laneid.getLoc(), laneid, xDim);
-
-  auto shiftX = rewriter.create<arith::AddIOp>(
-      laneid.getLoc(),
-      getValueOrCreateConstantIndexOp(rewriter, laneid.getLoc(),
-                                      descOffsets[0]),
-      laneid);
-  auto shiftY = rewriter.create<arith::AddIOp>(
-      laneid.getLoc(),
-      getValueOrCreateConstantIndexOp(rewriter, laneid.getLoc(),
-                                      descOffsets[1]),
-      laneid);
-
-  auto dataSizes = sgMap.getWiData();
-  auto viewShape = descOp.getTensorDescShape();
-  SmallVector<int64_t, 2> distributedShape;
-
-  for (const auto [l, s] : llvm::zip(layout, viewShape)) {
-    if (!divisible(APInt(64, s), APInt(64, l)))
-      return rewriter.notifyMatchFailure(
-          descOp,
-          "the tensor dimentions are not divisible by the distribution factor");
-    distributedShape.push_back(s / l);
-  }
-
-  auto srcType = srcTypedVal.getType();
-
-  SmallVector<OpFoldResult> mixedOffsets = getAsOpFoldResult({shiftX, shiftY});
-
-  // use the base memref strides
-  SmallVector<OpFoldResult> overwriteStrides =
-      getAsIndexOpFoldResult(rewriter.getContext(), SmallVector<int64_t>{1, 1});
-  SmallVector<OpFoldResult> overwriteSizes =
-      getAsIndexOpFoldResult(rewriter.getContext(), distributedShape);
+  auto offset_y =
+      rewriter.create<arith::DivUIOp>(laneid.getLoc(), laneid, xDim);
 
   auto distributedDescTypeOrFailure = getDistributedTensorDescType(
       descOp.getType(), sgMap, descOp.getType().getMemorySpace());
@@ -1115,6 +1082,12 @@ WarpOpTensorDescOp::matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
     return rewriter.notifyMatchFailure(descOp,
                                        "Failed to distribute the desc type");
   xegpu::TensorDescType newTDescType = distributedDescTypeOrFailure.value();
+  auto distributedShape = newTDescType.getShape();
+  // use the base memref strides
+  SmallVector<OpFoldResult> overwriteStrides =
+      getAsIndexOpFoldResult(rewriter.getContext(), SmallVector<int64_t>{1, 1});
+  SmallVector<OpFoldResult> overwriteSizes =
+      getAsIndexOpFoldResult(rewriter.getContext(), distributedShape);
 
   SmallVector<size_t> newRetIndices;
   vector::WarpExecuteOnLane0Op newWarpOp =
@@ -1122,31 +1095,15 @@ WarpOpTensorDescOp::matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
           rewriter, warpOp, descOp.getSource(), descOp.getSourceType(),
           newRetIndices);
 
-  DBGS() << "after replacing warp op:\n"
-         << newWarpOp.getOperation()->getParentOfType<func::FuncOp>();
-
   rewriter.setInsertionPointAfter(newWarpOp);
   auto subview = rewriter.create<memref::SubViewOp>(
       newWarpOp.getLoc(), srcTypedVal, descOp.getMixedOffsets(), overwriteSizes,
       overwriteStrides);
   subview.getSourceMutable().assign(newWarpOp.getResult(newRetIndices[0]));
 
-  DBGS() << "after inserting subview:\n"
-         << newWarpOp.getOperation()->getParentOfType<func::FuncOp>();
-
-  auto distributedDescType = xegpu::TensorDescType::get(
-      distributedShape, descOp.getElementType(), /*array_lenght=*/1,
-      /*boundary_check=*/true,
-      static_cast<xegpu::MemorySpace>(descOp.getSourceMemorySpace()),
-      descOp.getType().getSgMap());
-
-  SmallVector<int64_t> zeroOffsets{0, 0};
   auto newDescOp = rewriter.create<xegpu::CreateNdDescOp>(
       newWarpOp.getLoc(), newTDescType, subview,
       getAsOpFoldResult({offset_x, offset_y}));
-
-  DBGS() << "after inserting new desc op:\n"
-         << newWarpOp.getOperation()->getParentOfType<func::FuncOp>();
 
   Value distributedVal = newWarpOp.getResult(operandIdx);
   rewriter.replaceAllUsesWith(distributedVal, newDescOp);
