@@ -56,7 +56,25 @@ private:
   unsigned subgroupSize;
 };
 
+struct FuncDistributor2 final : public OpRewritePattern<func::FuncOp> {
+  FuncDistributor2(MLIRContext *ctx, const unsigned subgroup_size = 16)
+      : OpRewritePattern(ctx), subgroupSize(subgroup_size) {}
+
+  LogicalResult matchAndRewrite(func::FuncOp funcOp,
+                                PatternRewriter &rewriter) const override;
+
+private:
+  unsigned subgroupSize;
+};
+
 struct DescriptorHoister final
+    : public OpRewritePattern<vector::WarpExecuteOnLane0Op> {
+  using OpRewritePattern<vector::WarpExecuteOnLane0Op>::OpRewritePattern;
+  LogicalResult matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
+                                PatternRewriter &rewriter) const override;
+};
+
+struct WarpOpTensorDescOp final
     : public OpRewritePattern<vector::WarpExecuteOnLane0Op> {
   using OpRewritePattern<vector::WarpExecuteOnLane0Op>::OpRewritePattern;
   LogicalResult matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
@@ -70,7 +88,21 @@ struct WarpOpStoreNd final
                                 PatternRewriter &rewriter) const override;
 };
 
+struct WarpOpStoreNd2 final
+    : public OpRewritePattern<vector::WarpExecuteOnLane0Op> {
+  using OpRewritePattern<vector::WarpExecuteOnLane0Op>::OpRewritePattern;
+  LogicalResult matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
+                                PatternRewriter &rewriter) const override;
+};
+
 struct WarpOpLoadNd final
+    : public OpRewritePattern<vector::WarpExecuteOnLane0Op> {
+  using OpRewritePattern<vector::WarpExecuteOnLane0Op>::OpRewritePattern;
+  LogicalResult matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
+                                PatternRewriter &rewriter) const override;
+};
+
+struct WarpOpLoadNd2 final
     : public OpRewritePattern<vector::WarpExecuteOnLane0Op> {
   using OpRewritePattern<vector::WarpExecuteOnLane0Op>::OpRewritePattern;
   LogicalResult matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
@@ -773,11 +805,363 @@ FuncDistributor::matchAndRewrite(func::FuncOp funcOp,
   return success();
 }
 
+namespace {
+// This seems to need an interface or smth
+bool isOpRequiringDistribution(Operation *op) {
+  if (auto desc = dyn_cast<xegpu::CreateNdDescOp>(op))
+    return bool(desc.getType().getSgMap());
+  if (auto load = dyn_cast<xegpu::LoadNdOp>(op))
+    return bool(load.getTensorDescType().getSgMap());
+  if (auto store = dyn_cast<xegpu::StoreNdOp>(op))
+    return bool(store.getTensorDescType().getSgMap());
+  return false;
+}
+bool blockNeedsDistribution(Block &block) {
+  bool distributionRequired = false;
+  block.walk([&](Operation *op) {
+    if (isOpRequiringDistribution(op) &&
+        !op->getParentOfType<vector::WarpExecuteOnLane0Op>())
+      distributionRequired = true;
+  });
+  return distributionRequired;
+}
+} // namespace
+
+LogicalResult
+FuncDistributor2::matchAndRewrite(func::FuncOp funcOp,
+                                  PatternRewriter &rewriter) const {
+  if (funcOp.getFunctionBody().getBlocks().size() != 1)
+    return rewriter.notifyMatchFailure(funcOp, "Multiple blocks not supported");
+  if (!blockNeedsDistribution(funcOp.getFunctionBody().getBlocks().front()))
+    return rewriter.notifyMatchFailure(funcOp, "No ops require distribution");
+  DBGS() << "Handling function name: " << funcOp.getName() << "\n";
+  if (funcOp.getResultTypes().size() != 0)
+    return rewriter.notifyMatchFailure(
+        funcOp, "Assuming no return value for a kernel, function calls will "
+                "need signature distribution");
+  DBGS() << "Original function:\n" << funcOp << "\nEnd of original function\n";
+  std::string clonedFuncOpName = funcOp.getName().str();
+  auto clonedFuncOp = rewriter.create<func::FuncOp>(
+      funcOp->getLoc(), clonedFuncOpName, funcOp.getFunctionType());
+  SymbolTable::setSymbolVisibility(clonedFuncOp,
+                                   SymbolTable::getSymbolVisibility(funcOp));
+
+  assert(clonedFuncOp.getBlocks().size() == 0);
+  Block *entry = clonedFuncOp.addEntryBlock();
+  rewriter.setInsertionPointToStart(entry);
+  Location loc = clonedFuncOp.getLoc();
+
+  auto laneId =
+      rewriter.create<gpu::LaneIdOp>(loc, rewriter.getIndexAttr(subgroupSize));
+  auto warpOp = rewriter.create<vector::WarpExecuteOnLane0Op>(
+      loc, TypeRange(), laneId.getResult(), subgroupSize,
+      clonedFuncOp.getArguments(), clonedFuncOp.getArgumentTypes());
+  warpOp.getWarpRegion().takeBody(funcOp.getFunctionBody());
+  Block &warpBlock = funcOp.getFunctionBody().emplaceBlock();
+  rewriter.eraseOp(&warpOp.getWarpRegion().getBlocks().back().back());
+  rewriter.setInsertionPointToEnd(&warpOp.getWarpRegion().getBlocks().back());
+  rewriter.create<vector::YieldOp>(loc);
+
+  rewriter.setInsertionPointToEnd(entry);
+  auto ret = rewriter.create<func::ReturnOp>(loc);
+
+  rewriter.replaceOp(funcOp, clonedFuncOp);
+  DBGS() << "After replacing:\n"
+         << clonedFuncOp << "\nEnd of replaced function.\n";
+  return success();
+}
+
+namespace {
+FailureOr<VectorType> getDistributedVectorType(VectorType originalT,
+                                               xegpu::SGMapAttr sgMap) {
+  llvm::SmallVector<int64_t, 2> distributedShape;
+  auto layout = sgMap.getWiLayout();
+  auto shape = originalT.getShape();
+  for (const auto [l, o] : llvm::zip_equal(layout, shape)) {
+    if (!divisible(APInt(64, o), APInt(64, l)))
+      return failure();
+    distributedShape.push_back(o / l);
+  }
+  auto newVectorType =
+      VectorType::get(distributedShape, originalT.getElementType(),
+                      originalT.getScalableDims());
+  return newVectorType;
+}
+FailureOr<xegpu::TensorDescType>
+getDistributedTensorDescType(xegpu::TensorDescType originalT,
+                             xegpu::SGMapAttr sgMap,
+                             xegpu::MemorySpace memSpace) {
+  llvm::SmallVector<int64_t, 2> distributedShape;
+  auto layout = sgMap.getWiLayout();
+  auto shape = originalT.getShape();
+  for (const auto [l, o] : llvm::zip_equal(layout, shape)) {
+    if (!divisible(APInt(64, o), APInt(64, l)))
+      return failure();
+    distributedShape.push_back(o / l);
+  }
+  xegpu::TensorDescType distributedDescType;
+  if (originalT.isScattered()) {
+
+    distributedDescType = xegpu::TensorDescType::get(
+        distributedShape, originalT.getElementType(), originalT.getChunkSize(),
+        originalT.getMemorySpace());
+  } else {
+    distributedDescType = xegpu::TensorDescType::get(
+        distributedShape, originalT.getElementType(),
+        originalT.getBoundaryCheck(), originalT.getArrayLength(),
+        originalT.getMemorySpace());
+  }
+  return distributedDescType;
+}
+} // namespace
+
+LogicalResult
+WarpOpStoreNd2::matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
+                                PatternRewriter &rewriter) const {
+  auto yield = cast<vector::YieldOp>(
+      warpOp.getBodyRegion().getBlocks().begin()->getTerminator());
+  Operation *lastNode = yield->getPrevNode();
+  auto storeOp = dyn_cast_or_null<xegpu::StoreNdOp>(lastNode);
+  if (!storeOp)
+    return failure();
+
+  auto origType = storeOp.getTensorDescType();
+  xegpu::SGMapAttr sgMap = origType.getSGMapAttr();
+  if (!sgMap)
+    return rewriter.notifyMatchFailure(
+        storeOp, "the source tensor descriptor lacks sg_map attribute");
+
+  if (storeOp.getTensorDescType().getShape().size() != 2)
+    return rewriter.notifyMatchFailure(storeOp, "unsupported shape");
+  DBGS() << "Matched store_nd: " << storeOp << "\n";
+
+  auto distributedTypeOrFailure =
+      getDistributedVectorType(storeOp.getValueType(), sgMap);
+  if (failed(distributedTypeOrFailure))
+    return rewriter.notifyMatchFailure(storeOp,
+                                       "Failed to distribute the type");
+  VectorType newVectorType = distributedTypeOrFailure.value();
+
+  auto distributedDescTypeOrFailure = getDistributedTensorDescType(
+      storeOp.getTensorDescType(), sgMap,
+      storeOp.getTensorDescType().getMemorySpace());
+  if (failed(distributedDescTypeOrFailure))
+    return rewriter.notifyMatchFailure(storeOp,
+                                       "Failed to distribute the desc type");
+  xegpu::TensorDescType newTDescType = distributedDescTypeOrFailure.value();
+
+  SmallVector<size_t> newRetIndices;
+  vector::WarpExecuteOnLane0Op newWarpOp =
+      moveRegionToNewWarpOpAndAppendReturns(
+          rewriter, warpOp,
+          ValueRange{storeOp.getTensorDesc(), storeOp.getValue()},
+          TypeRange{newTDescType, newVectorType}, newRetIndices);
+
+  rewriter.setInsertionPointAfter(newWarpOp);
+  auto newStoreOp =
+      cast<xegpu::StoreNdOp>(rewriter.clone(*storeOp.getOperation()));
+  rewriter.eraseOp(storeOp);
+  newStoreOp.getTensorDescMutable().assign(
+      newWarpOp.getResult(newRetIndices[0]));
+  newStoreOp.getValueMutable().assign(newWarpOp.getResult(newRetIndices[1]));
+
+  DBGS() << "IR after store distribution:\n"
+         << newWarpOp.getOperation()->getParentOfType<func::FuncOp>() << "\n";
+  return success();
+}
+
+LogicalResult
+WarpOpLoadNd2::matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
+                               PatternRewriter &rewriter) const {
+  OpOperand *operand = getWarpResult(warpOp, [](Operation *op) {
+    return isa<xegpu::LoadNdOp>(op) && op->hasOneUse();
+  });
+
+  if (!operand)
+    return rewriter.notifyMatchFailure(warpOp,
+                                       "warp result is not a xegpu::LoadNd op");
+
+  auto loadOp = operand->get().getDefiningOp<xegpu::LoadNdOp>();
+
+  if (loadOp.getPacked())
+    rewriter.notifyMatchFailure(loadOp,
+                                "Packed load distribution not supported");
+
+  xegpu::TensorDescType origType = loadOp.getTensorDescType();
+  xegpu::SGMapAttr sgMap = origType.getSGMapAttr();
+  if (!sgMap)
+    return rewriter.notifyMatchFailure(
+        loadOp, "the source tensor descriptor lacks sg_map attribute");
+
+  auto origShape = origType.getShape();
+  if (origShape.size() != 2)
+    return rewriter.notifyMatchFailure(loadOp, "unsupported shape");
+
+  auto distributedTypeOrFailure =
+      getDistributedVectorType(loadOp.getType(), sgMap);
+  if (failed(distributedTypeOrFailure))
+    return rewriter.notifyMatchFailure(loadOp, "Failed to distribute the type");
+  VectorType newVectorType = distributedTypeOrFailure.value();
+
+  auto distributedDescTypeOrFailure =
+      getDistributedTensorDescType(loadOp.getTensorDescType(), sgMap,
+                                   loadOp.getTensorDescType().getMemorySpace());
+  if (failed(distributedDescTypeOrFailure))
+    return rewriter.notifyMatchFailure(loadOp,
+                                       "Failed to distribute the desc type");
+  xegpu::TensorDescType newTDescType = distributedDescTypeOrFailure.value();
+
+  unsigned operandIdx = operand->getOperandNumber();
+
+  SmallVector<size_t> newRetIndices;
+  vector::WarpExecuteOnLane0Op newWarpOp =
+      moveRegionToNewWarpOpAndAppendReturns(
+          rewriter, warpOp, loadOp.getTensorDesc(), TypeRange{newTDescType},
+          newRetIndices);
+
+  rewriter.setInsertionPointAfter(newWarpOp);
+
+  auto newLoadOp = rewriter.create<xegpu::LoadNdOp>(
+      loadOp.getLoc(), newVectorType, loadOp.getTensorDesc(),
+      loadOp.getPackedAttr(), loadOp.getTransposeAttr(), loadOp.getL1HintAttr(),
+      loadOp.getL2HintAttr(), loadOp.getL3HintAttr());
+
+  newLoadOp.getTensorDescMutable().assign(
+      newWarpOp.getResult(newRetIndices[0]));
+  Value distributedVal = newWarpOp.getResult(operandIdx);
+  rewriter.replaceAllUsesWith(distributedVal, newLoadOp);
+
+  DBGS() << "IR after load distribution:\n"
+         << newWarpOp.getOperation()->getParentOfType<func::FuncOp>() << "\n";
+  return success();
+}
+
+LogicalResult
+WarpOpTensorDescOp::matchAndRewrite(vector::WarpExecuteOnLane0Op warpOp,
+                                    PatternRewriter &rewriter) const {
+  OpOperand *operand = getWarpResult(warpOp, [](Operation *op) {
+    return isa<xegpu::CreateNdDescOp>(op) && op->hasOneUse();
+  });
+
+  if (!operand)
+    return rewriter.notifyMatchFailure(
+        warpOp, "warp result is not a xegpu::CreateNdDesc op");
+  auto descOp = operand->get().getDefiningOp<xegpu::CreateNdDescOp>();
+  DBGS() << "Found a create_nd_desc op for distribution: " << descOp << "\n";
+  assert(descOp && "desc op must be not null");
+  unsigned operandIdx = operand->getOperandNumber();
+
+  // TODO: is memref uniform in the region
+  rewriter.setInsertionPoint(warpOp);
+  auto srcTypedVal = dyn_cast<TypedValue<MemRefType>>(descOp.getSource());
+  assert(srcTypedVal && "source value must be not null");
+
+  auto descOffsets = descOp.getMixedOffsets();
+  if (descOffsets.size() != 2)
+    rewriter.notifyMatchFailure(descOp, "offsets size is expected to be 2");
+
+  xegpu::SGMapAttr sgMap = descOp.getType().getSGMapAttr();
+  if (!sgMap)
+    return rewriter.notifyMatchFailure(
+        descOp, "the tensor descriptor lacks sg_map attribute");
+
+  auto layout = sgMap.getWiLayout();
+
+  // Calculate the offset within tensor descriptor for the current lane_id
+  auto laneid = warpOp.getLaneid();
+  auto xDim =
+      rewriter.create<arith::ConstantIndexOp>(laneid.getLoc(), layout[0]);
+  auto offset_x =
+      rewriter.create<arith::DivUIOp>(laneid.getLoc(), laneid, xDim);
+  auto offset_y =
+      rewriter.create<arith::RemUIOp>(laneid.getLoc(), laneid, xDim);
+
+  auto shiftX = rewriter.create<arith::AddIOp>(
+      laneid.getLoc(),
+      getValueOrCreateConstantIndexOp(rewriter, laneid.getLoc(),
+                                      descOffsets[0]),
+      laneid);
+  auto shiftY = rewriter.create<arith::AddIOp>(
+      laneid.getLoc(),
+      getValueOrCreateConstantIndexOp(rewriter, laneid.getLoc(),
+                                      descOffsets[1]),
+      laneid);
+
+  auto dataSizes = sgMap.getWiData();
+  auto viewShape = descOp.getTensorDescShape();
+  SmallVector<int64_t, 2> distributedShape;
+
+  for (const auto [l, s] : llvm::zip(layout, viewShape)) {
+    if (!divisible(APInt(64, s), APInt(64, l)))
+      return rewriter.notifyMatchFailure(
+          descOp,
+          "the tensor dimentions are not divisible by the distribution factor");
+    distributedShape.push_back(s / l);
+  }
+
+  auto srcType = srcTypedVal.getType();
+
+  SmallVector<OpFoldResult> mixedOffsets = getAsOpFoldResult({shiftX, shiftY});
+
+  // use the base memref strides
+  SmallVector<OpFoldResult> overwriteStrides =
+      getAsIndexOpFoldResult(rewriter.getContext(), SmallVector<int64_t>{1, 1});
+  SmallVector<OpFoldResult> overwriteSizes =
+      getAsIndexOpFoldResult(rewriter.getContext(), distributedShape);
+
+  auto distributedDescTypeOrFailure = getDistributedTensorDescType(
+      descOp.getType(), sgMap, descOp.getType().getMemorySpace());
+  if (failed(distributedDescTypeOrFailure))
+    return rewriter.notifyMatchFailure(descOp,
+                                       "Failed to distribute the desc type");
+  xegpu::TensorDescType newTDescType = distributedDescTypeOrFailure.value();
+
+  SmallVector<size_t> newRetIndices;
+  vector::WarpExecuteOnLane0Op newWarpOp =
+      moveRegionToNewWarpOpAndAppendReturns(
+          rewriter, warpOp, descOp.getSource(), descOp.getSourceType(),
+          newRetIndices);
+
+  DBGS() << "after replacing warp op:\n"
+         << newWarpOp.getOperation()->getParentOfType<func::FuncOp>();
+
+  rewriter.setInsertionPointAfter(newWarpOp);
+  auto subview = rewriter.create<memref::SubViewOp>(
+      newWarpOp.getLoc(), srcTypedVal, descOp.getMixedOffsets(), overwriteSizes,
+      overwriteStrides);
+  subview.getSourceMutable().assign(newWarpOp.getResult(newRetIndices[0]));
+
+  DBGS() << "after inserting subview:\n"
+         << newWarpOp.getOperation()->getParentOfType<func::FuncOp>();
+
+  auto distributedDescType = xegpu::TensorDescType::get(
+      distributedShape, descOp.getElementType(), /*array_lenght=*/1,
+      /*boundary_check=*/true,
+      static_cast<xegpu::MemorySpace>(descOp.getSourceMemorySpace()),
+      descOp.getType().getSgMap());
+
+  SmallVector<int64_t> zeroOffsets{0, 0};
+  auto newDescOp = rewriter.create<xegpu::CreateNdDescOp>(
+      newWarpOp.getLoc(), newTDescType, subview,
+      getAsOpFoldResult({offset_x, offset_y}));
+
+  DBGS() << "after inserting new desc op:\n"
+         << newWarpOp.getOperation()->getParentOfType<func::FuncOp>();
+
+  Value distributedVal = newWarpOp.getResult(operandIdx);
+  rewriter.replaceAllUsesWith(distributedVal, newDescOp);
+
+  DBGS() << "IR after create_nd_desc distribution:\n"
+         << newWarpOp.getOperation()->getParentOfType<func::FuncOp>() << "\n";
+  return success();
+}
+
 void xegpu::populateXeGPUDistributeToWIPatterns(RewritePatternSet &patterns) {
-  patterns.add<FuncDistributor>(patterns.getContext());
-  patterns.add<DescriptorHoister>(patterns.getContext());
-  patterns.add<WarpOpStoreNd>(patterns.getContext());
-  patterns.add<WarpOpLoadNd>(patterns.getContext());
+  patterns.add<FuncDistributor2>(patterns.getContext());
+  // patterns.add<DescriptorHoister>(patterns.getContext());
+  patterns.add<WarpOpTensorDescOp>(patterns.getContext());
+  patterns.add<WarpOpStoreNd2>(patterns.getContext());
+  patterns.add<WarpOpLoadNd2>(patterns.getContext());
 
   patterns.add<WarpOpDeadResult>(patterns.getContext());
   patterns.add<WarpOpForwardOperand>(patterns.getContext());
