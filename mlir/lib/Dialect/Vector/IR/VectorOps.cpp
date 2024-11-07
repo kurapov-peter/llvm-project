@@ -6579,8 +6579,8 @@ static LogicalResult verifyDistributedType(Type expanded, Type distributed,
   // If the types matches there is no distribution.
   if (expanded == distributed)
     return success();
-  auto expandedVecType = llvm::dyn_cast<VectorType>(expanded);
-  auto distributedVecType = llvm::dyn_cast<VectorType>(distributed);
+  auto expandedVecType = llvm::dyn_cast<DistributableType>(expanded);
+  auto distributedVecType = llvm::dyn_cast<DistributableType>(distributed);
   if (!expandedVecType || !distributedVecType)
     return op->emitOpError("expected vector type for distributed operands.");
   if (expandedVecType.getRank() != distributedVecType.getRank() ||

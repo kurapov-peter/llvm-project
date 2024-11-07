@@ -1188,7 +1188,7 @@ def Builtin_VectorTypeElementType : AnyTypeOf<[AnyInteger, Index, AnyFloat]> {
 }
 
 def Builtin_Vector : Builtin_Type<"Vector", "vector",
-    [ShapedTypeInterface, ValueSemantics], "Type"> {
+    [ShapedTypeInterface, ValueSemantics, DistributableTypeInterface], "Type"> {
   let summary = "Multi-dimensional SIMD vector type";
   let description = [{
     Syntax:

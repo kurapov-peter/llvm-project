@@ -188,4 +188,29 @@ def ShapedTypeInterface : TypeInterface<"ShapedType"> {
   }];
 }
 
+//===----------------------------------------------------------------------===//
+// DistributableType
+//===----------------------------------------------------------------------===//
+def DistributableTypeInterface : TypeInterface<"DistributableType", [ShapedTypeInterface]> {
+  let cppNamespace = "::mlir";
+
+  let description = [{
+    Interface for types that can be distributed when converting from vector-like
+    representation to SIMT-like programming models. 
+  }];
+
+  let methods = [
+    InterfaceMethod<
+      /*description=*/"Return a distributed shape based on the original type, "
+                      "the distribution map, and the factors array.",
+      /*retTy=*/"::llvm::FailureOr<::llvm::SmallVector<int64_t>>",
+      /*methodName=*/"getDistributedShape",
+      /*args=*/(ins "::mlir::ShapedType":$originalType,
+                    "::mlir::AffineMap":$map,
+                    "::mlir::ArrayRef<int64_t>":$factors),
+      /*methodBody=*/"",
+      /*defaultImplementation=*/[{ return ::mlir::failure(); }]>,
+  ];
+}
+
 #endif // MLIR_IR_BUILTINTYPEINTERFACES_TD_
